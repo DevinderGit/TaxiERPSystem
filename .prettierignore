@@ -1,0 +1,20 @@
+node_modules
+dist
+supabase
+
+# Non-code project artefacts — operator-authored, do not reformat
+CLAUDE.MD
+docs/TaskList.md
+docs/worklog.md
+
+# Harness / editor config — not source
+.claude/
+
+# JSON with semantic structure — formatting noise outweighs benefit
+package-lock.json
+tsconfig.json
+tsconfig.app.json
+tsconfig.node.json
+
+# .gitkeep files are placeholder comments
+**/.gitkeep

@@ -1,49 +1,22 @@
-import { useEffect, useState } from 'react';
-import reactLogo from './assets/react.svg';
-import viteLogo from '/vite.svg';
-import { supabase } from './services/supabaseClient';
-import './App.css';
+import { BrowserRouter } from 'react-router-dom';
+import { NavBar } from './components/NavBar';
+import { AppRouter } from './components/AppRouter';
 
 /**
- * Root component for TAXI-001.
+ * Root component. Wraps the nav + routes in a single <BrowserRouter>
+ * so both NavBar's <NavLink>s and the route elements share the same
+ * router context. (Putting BrowserRouter inside AppRouter left the
+ * NavBar siblings outside the router context and crashed NavLink.)
  *
- * Per the Manual Test Plan step 4, this initial scaffold must render the
- * default Vite + React welcome page with both logos and no console errors.
- * Real panels, providers, and routing are added in TAXI-005 / TAXI-006.
+ * QueryClientProvider is set in main.tsx and wraps <App />.
+ * AuthProvider / RoleGuard (M2) will also wrap <App /> from main.tsx.
  */
 function App() {
-  const [count, setCount] = useState(0);
-
-  // TAXI-004 test — temporary. Will be removed after Manual Test Plan step 6 passes.
-  useEffect(() => {
-    supabase
-      .from('hello')
-      .select()
-      .then(({ data, error }) => {
-        // eslint-disable-next-line no-console
-        console.log('[TAXI-004 test] hello rows:', data, 'error:', error);
-      });
-  }, []);
-
   return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank" rel="noreferrer">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank" rel="noreferrer">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>count is {count}</button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">Click on the Vite and React logos to learn more</p>
-    </>
+    <BrowserRouter>
+      <NavBar />
+      <AppRouter />
+    </BrowserRouter>
   );
 }
 

@@ -74,5 +74,99 @@
   - **Manual Test Plan visual confirmation pending:** please open `http://127.0.0.1:54321/` in a browser (expect a JSON message) and `http://127.0.0.1:54323/` (expect Studio with Table Editor / SQL Editor / Auth tabs in the left sidebar).
   - **Non-blocking:** `supabase_vector` container is in a restart loop — it's the analytics/embedding sidecar, doesn't sit on the PostgREST/Auth/Storage data path. Worth a look later but not blocking M1.
 
+## 2026-09-16 19:10 IST — TAXI-003 — Dev environment quirk noted
+
+- What I observed: Docker Desktop was not running at the start of the TAXI-004 session — `docker ps` returned "failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine". The dev server and Supabase containers from TAXI-003 had all stopped (likely during a Claude Code session reset). Browser `fetch` of `http://127.0.0.1:54321/...` returned "Failed to fetch" / `TypeError`.
+- Resolution: launched Docker Desktop (`C:\Users\User\AppData\Local\Programs\DockerDesktop\Docker Desktop.exe`, ~45 s startup), ran `supabase start` — containers came back from the persistent Docker volumes, no data loss (the `hello` test row from TAXI-004 prep survived).
+- Implication for future tickets: every test step that needs both dev server + Supabase must assume Docker may be stopped at session start. If browser sees "Failed to fetch" or `docker info` errors, restart Docker Desktop + `supabase start` before debugging application code. Will keep this convention in mind for every M0..M14 ticket.
+
+## 2026-09-16 19:35 IST — TAXI-004 — Create typed supabaseClient singleton
+
+- What I changed (files):
+  - `src/services/supabaseClient.ts` (new) — singleton `supabase = createClient(url, anonKey)`. Reads `import.meta.env.VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`. Throws on missing env. Persists session, auto-refresh token, no URL detection (we don't use magic links). DB row types are `any` for now until schema-generated types land in M14.
+  - `src/vite-env.d.ts` (extended) — `ImportMetaEnv` interface declares `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`, `VITE_SUPABASE_SERVICE_ROLE_KEY` so TS knows the env shape.
+  - `src/App.tsx` (temporary test hook added → reverted — net change: 0).
+  - `supabase/migrations/20260916180000_create_hello.sql` (temporary → deleted; `.gitkeep` restored).
+- Why: per Code Architecture spec §4.1, supabaseClient is the single PostgREST / Auth / Storage / Realtime entry point. Every later ticket reads/writes through this singleton (per §5.1 dependency rule "Service → supabaseClient"). Generic Supabase client with persistent session is sufficient for M0; schema-generated types arrive in M14.
+- Manual test status:
+  - Step 2–3 — **PASS** (`npm run build` clean with the new env types; bundle grew 144 KB → 372 KB confirming `@supabase/supabase-js` was bundled; `tsc -b` reported no errors).
+  - Step 4–5 — **PASS** (verified during the troubleshooting detour: `curl http://127.0.0.1:54321/` returns JSON, `curl http://127.0.0.1:54321/rest/v1/hello?select=*` returns `[{"id":1,"msg":"world"}]` with HTTP 200; the temporary migration applied cleanly via `supabase db reset`).
+  - Step 6 — **PASS by operator** (operator confirmed `[TAXI-004 test] hello rows: [{id:1, msg:"world"}]` was logged in F12 → Console). Note: the row appears TWICE in dev — this is React 18 `<StrictMode>` intentionally double-invoking effects in dev mode (per main.tsx). Production builds do not double-invoke. Documented as expected behaviour.
+  - Step 6 cleanup — **PASS** (`supabase db reset` re-ran with no real migrations in the folder; `GET /rest/v1/hello` → HTTP 404 confirms the table was dropped; `.gitkeep` restored; App.tsx reverted to the pristine Vite + React welcome — bundle back to 144 KB).
+  - Bonus — `npm run lint` — **PASS** (exit 0 after both with-test and after-revert states).
+- Open questions for operator: none. The CSP warning in the browser dev tools (noted during TAXI-003 verification) is a Chrome heuristic flagging Vite's React Refresh runtime. We don't set CSP anywhere; not blocking. Will address as a hardening item in M15 with a meta-CSP header for the prod bundle.
+
+## 2026-09-16 20:10 IST — TAXI-005 — Set up TanStack Query + Zustand providers
+
+- What I changed (files):
+  - `src/services/queryClient.ts` (new) — singleton `QueryClient` with `staleTime: 5min`, `refetchOnWindowFocus: true`, `retry: 1` for queries, `retry: 0` for mutations (mutations are user-driven — silent retry hides errors).
+  - `src/store/uiStore.ts` (new) — root Zustand store. First occupants: `dutySlipModalOpen` + `dutySlipModalId` (M8 prep), `billingModalOpen` + `billingModalCustomerId` (M9 prep). Form drafts intentionally left to React Hook Form's per-component state per spec.
+  - `src/hooks/useEntityQuery.ts` (new) — generic TanStack Query wrapper. Returns `{list, get, create, update, delete, invalidate}` per spec. `list()` returns the reactive `useQuery` result; `get(id)` is `queryClient.fetchQuery`-backed (imperative, safe to call from any handler); mutation triggers invalidate the `['entity', entity]` query key on success. DB row types are `Record<string, any>` until schema-generated types arrive in M14.
+  - `src/main.tsx` — wrapped `<App />` in `<QueryClientProvider client={queryClient}>` inside the existing `<StrictMode>`.
+  - `src/App.tsx` (temporary test hook added → reverted — net change: 0).
+  - `supabase/migrations/20260916200000_create_customers_test.sql` (temporary → deleted; `.gitkeep` restored).
+- Why: per Code Architecture spec §4.1, every panel page/form calls `useEntityQuery(entity)` to read/write; the QueryClient cache lives behind a single provider; Zustand holds the cross-component UI flags (modals) that don't belong in any single component or in the server cache.
+- Manual test status:
+  - Build — **PASS** (`tsc -b` clean with the new generic types; bundle grew 144 KB → 414 KB during the test as expected; reverted state bundle = 173 KB — TanStack Query + Zustand stay in the bundle because main.tsx imports them).
+  - Step 2 (no React "missing provider" warnings) — **PASS** (operator's console showed only the intended `[TAXI-005 test]` log + React's standard "Download React DevTools" hint; no provider warnings).
+  - Step 4 (React DevTools shows `QueryClientProvider` ancestor of `App`) — operator did not install React DevTools browser extension (would require an additional install). The bundle wiring is provably correct via `main.tsx` source inspection and the live console output (the query state was retrieved reactively, which requires the provider to be mounted).
+  - Step 6 (settled state) — **PASS by operator** (operator confirmed the third log line: `{data: Array(0), isLoading: false, isError: false}` — `Array(0)` is the empty array the spec required; the first two logs with `data: undefined, isLoading: true` were transient pre-fetch states, not failures).
+  - Cleanup — **PASS** (`supabase db reset` re-ran with no real migrations in the folder; `GET /rest/v1/customers` → HTTP 404 confirms the table was dropped; `.gitkeep` restored).
+  - `npm run lint` — **PASS** (exit 0).
+- API deviation (flagged): spec lists `get(id)` as a method on the hook return object. Calling `useQuery` from inside a returned function violates Rules of Hooks, so I implemented `get(id)` as a Promise-returning function backed by `queryClient.fetchQuery`. `list()` stays reactive. Single-record reads work but are imperative; for reactive single-row subscriptions a future `useEntityGet(entity, id)` separate hook is the right escape hatch. Tell me if you want me to rename or split now.
+- Open questions for operator: none. Both providers (QueryClientProvider, useUIStore) are in place; the hook is ready for M3 onwards.
+
+## 2026-09-16 20:35 IST — TAXI-006 — Set up React Router with lazy-loaded panel routes
+
+- What I changed (files):
+  - `src/components/AppRouter.tsx` (new) — `BrowserRouter` + `<Suspense fallback={<LoadingFallback/>}>` wrapping `<Routes>` with one route per panel plus login/unauthorized/home/404. Each panel module is `React.lazy(() => import('...').then(m => ({default: m.X})))`-imported so Vite emits a separate JS chunk per panel.
+  - `src/components/NavBar.tsx` (new) — top nav with `NavLink`s to `/`, `/master`, `/daily-work`, `/accounts`, `/reports`. Active link is highlighted.
+  - `src/components/HomePage.tsx`, `src/components/NotFoundPage.tsx`, `src/components/LoadingFallback.tsx` (new) — placeholder pages + Suspense fallback.
+  - `src/panels/auth/{LoginPage, UnauthorizedPage}.tsx` (new) — placeholders. LoginPage is a real element (will be replaced by TAXI-204). UnauthorizedPage is reachable from M2's RoleGuard.
+  - `src/panels/{master, dailywork, accounts, reports}/<Name>Panel.tsx` (new) — placeholders, one named export per panel so `lazy()` can resolve them.
+  - `src/App.tsx` — replaced the Vite + React welcome content with `<NavBar/><AppRouter/>`.
+- Why: per Code Architecture spec §4.1 ("AppRouter"), the SPA is composed of four lazy-loaded panel modules behind a single route table. Per the Manual Test Plan step 9, each click must trigger a separate JS chunk download — which only works if the panel is dynamically imported. The NavBar stays in the layout (not in any panel) so it renders on every route and survives panel reloads.
+- Manual test status:
+  - Step 1–2 (build + lint) — **PASS** (`npm run build` emits `dist/assets/{MasterPanel, DailyWorkPanel, AccountsPanel, ReportsPanel, LoginPage, UnauthorizedPage}-*.js` chunks, each ≤ 0.35 kB; main bundle dropped from 414 KB → 197 KB confirming panel code is excluded from the initial load. `npm run lint` exits 0.)
+  - Dev server smoke — **PASS** (curl on `/`, `/master`, `/some-fake-url` all return 200 with `index.html` — SPA fallback works; React Router handles the routing client-side once index.html loads).
+  - Steps 2–9 (browser-only) — **PENDING operator**: nav links visible, each panel loads its placeholder, `/some-fake-url` shows NotFoundPage, Network tab shows separate chunk downloads per panel click.
+- API / deviation notes:
+  - LoginPage renders a placeholder body instead of redirecting to `/` (the redirect would make the `lazy()` import dead code; the placeholder body is a more honest intermediate state until TAXI-204).
+  - NavBar is unconditional on every route. M2 (RoleGuard in TAXI-203) will hide links the current role cannot reach.
+- Open questions for operator: none.
+
+## 2026-09-16 20:55 IST — TAXI-006 — Bug fix: Router context missing around NavBar
+
+- Symptom (operator's console): `Uncaught TypeError: Cannot destructure property 'future' of 'React.useContext(...)' as it is null. at useResolvedPath (hooks.tsx:313:9) at NavLinkWithRef`. The `NavBar` siblings were outside the router context.
+- Root cause: in the initial implementation `App.tsx` rendered `<NavBar/>` and `<AppRouter/>` as siblings, while `AppRouter` held its own `<BrowserRouter>` internally. The `BrowserRouter` provides the router context only to its descendants, so the sibling `<NavBar/>` (and its `<NavLink>`s) ran with no router context above them and crashed.
+- Fix:
+  - `src/App.tsx` — now wraps both `<NavBar/>` and `<AppRouter/>` in a single `<BrowserRouter>` (imported directly from `react-router-dom`).
+  - `src/components/AppRouter.tsx` — removed its inner `<BrowserRouter>`; the component now only renders `<Suspense><Routes>...</Routes></Suspense>`. The comment in the file documents the rationale so the next person doesn't re-introduce the dual-router mistake.
+- Verified:
+  - `npm run build` clean (still 6 panel chunks emitted; main bundle 197 KB).
+  - `npm run lint` exits 0.
+  - Operator should now re-test: refresh, click each nav link, confirm `http://localhost:5173/some-fake-url` shows NotFoundPage, confirm Network tab downloads a separate chunk per panel click.
+- Process note: I made a typo in the file path on first attempt (`D:\FullFullApps\…` instead of `D:\FullStackApps\…`), wrote to the wrong tree, then cleaned it up (`rm -rf D:/FullFullApps`) and rewrote at the correct path. Caught immediately because the next Bash call (`ls D:/FullFullApps`) errored; nothing leaked into git. Logging here so I'm not silently hiding the typo.
+
+## 2026-09-16 21:10 IST — TAXI-006 — Design system + layout refresh
+
+- Operator feedback: "functionality is working but the design is not right. Use taxi colors — yellow and black." Replaced the inline-styled light-theme placeholders with a proper design system driven by CSS variables and class-based components.
+- What I changed (files):
+  - `src/index.css` — full design-token sheet (palette, radii, shadows, typography) + layout primitives (`app-nav`, `app-main`, `card`, `card-grid`, `page-title`, `badge`, `loading` with spinner). All values centralized as CSS variables so panel-specific tweaks in M3..M7 won't need to redefine colors.
+  - `src/components/NavBar.tsx` — sticky black nav with `🚕 TAXI ERP` brand mark (yellow), 3 px yellow rule under it, active link is filled yellow with black text.
+  - `src/components/HomePage.tsx` — hero + 4-card grid (each card = panel entry, yellow left rule, M-module badge).
+  - `src/components/NotFoundPage.tsx`, `src/components/LoadingFallback.tsx` — consistent shell + CSS-only spinner.
+  - `src/panels/{auth,master,dailywork,accounts,reports}/*` placeholders — uniform `<main className="app-main">` shell with hero, subtitle, single accent card describing the upcoming module range.
+  - `src/App.css` — emptied to a one-line note (was the Vite welcome styling; no longer needed).
+- Palette (Black Cab / Yellow Cab):
+  - `--color-bg: #0c0c0e`, `--color-surface: #16161a`, `--color-surface-2: #1f1f24`, `--color-border: #2a2a30`
+  - `--color-accent: #facc15`, `--color-accent-hover: #eab308`, `--color-accent-text: #0c0c0e`
+  - `--color-text: #f5f5f7`, `--color-text-muted: #9ca3af`
+  - Typography: `system-ui` stack, 15 px base, 1.5 line-height.
+- Verified:
+  - `npm run build` clean (6 lazy panel chunks emitted; main bundle 198 KB; panel chunks grew from ~0.3 KB → ~0.6 KB due to the new card markup — still negligible).
+  - `npm run lint` exits 0.
+  - Operator visual confirmation **PASS** ("design is now right, using taxi colors").
+- Convention going forward: every page wraps its content in `<main className="app-main">` and uses the `.card`, `.card--accent`, `.page-title`, `.page-subtitle`, `.badge` classes. New colours only via CSS variables in `index.css`; never hard-code hex in component files.
 
 

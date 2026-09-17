@@ -1,0 +1,5 @@
+/* App.css intentionally minimal — most styling lives in index.css
+ * (the design-system token sheet) and the page-level CSS classes
+ * (app-nav, app-main, card, page-title, etc.). This file is kept
+ * because Vite's React-TS template references it from App.tsx; future
+ * component-scoped rules can land here. */

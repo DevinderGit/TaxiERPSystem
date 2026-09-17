@@ -1,0 +1,2 @@
+# Placeholder — panel modules are added one per M3..M13 ticket.
+# Each panel owns its own subfolder (master/, dailywork/, accounts/, reports/, auth/, settings/).

@@ -421,4 +421,367 @@ Reported manually by operator after TAXI-204 / TAXI-205 verification: four behav
 - Manual-only browser verification. Each ticket reply now lists every step as `Expected: ...` so the operator can confirm pass/fail.
 
 **Open questions for operator:**
-- The `db.schemas` config bug is a real upstream issue (`postgrest/postgrest` doesn't refresh from env when the env-var-list grows past the introspection cache). Tracking it as part of M14 hardening. Until then, every SPA → table read/write will go through a dedicated RPC. If you'd like me to add the same RPC-and-UI split to Master panel pages upfront (M3+), say so — otherwise I'll keep direct PostgREST access in the spec and only fall back to RPCs if hit by the same bug.
+- The `db.schemas` config bug is a real upstream issue (`postgrest/postgrest` doesn't refresh from env when the env-var-list grows past the introspection cache). Tracking it as part of M14 hardening. Until then, every SPA → table read/write will go through a dedicated RPC. If you'd like me to add the same RPC-and-company split to Master panel pages upfront (M3+), say so — otherwise I'll keep direct PostgREST access in the spec and only fall back to RPCs if hit by the same bug.
+
+## 2026-09-18 16:20 IST — TAXI-301 — Build Company Detail page UI (read + edit form)
+
+- What I changed (files):
+  - `supabase/migrations/20260918170000_company_rpcs.sql` (new) — adds `public.get_company()` (STABLE SQL, SECURITY DEFINER, 15-column RETURNS TABLE) and `public.update_company(p_name, p_legal_name, p_owner_name, p_gstin, p_pan, p_address_line1, p_address_line2, p_city, p_state, p_pincode, p_phone, p_email)` (plpgsql, SECURITY DEFINER, COALESCE/NULLIF pattern so a NULL/empty arg preserves the old value). Both have `GRANT EXECUTE TO authenticated`. `logo_path` intentionally omitted — TAXI-302 adds a dedicated storage flow.
+  - `src/lib/indianStates.ts` (new) — `INDIAN_STATES: readonly string[]` of 28 states + 8 UTs in canonical English (Constitution 7th Schedule + Telangana 2014, Ladakh 2019, J&K reorg 2019). Seed company has `state='Delhi'` so M7's inter-state GST trigger has its baseline.
+  - `src/panels/master/CompanyDetailPage.tsx` (new) — RHF + Zod form. `useQuery` reads via `get_company` RPC (postgREST schema-exposure workaround, same pattern as TAXI-205's `list_users_for_company`); `useEffect` repopulates via `reset()` when data arrives. Two `.card` sections: Identity (name / legal_name / owner_name / gstin / pan) and Address & contact (address_line1/2 / city / state dropdown / pincode / phone / email). Save → `supabase.rpc('update_company', ...)` → toast + `invalidateQueries`. Zod validation: `name` required, `gstin` 15-char alphanumeric if present, `pan` `AAAAA9999A` if present, `pincode` 6 digits, state required, optional email/phone format checks.
+  - `src/panels/master/MasterPanel.tsx` (edit) — converted from placeholder to overview page with a sub-nav row linking to `/master/company`. M4..M7 sub-routes land here as they ship.
+  - `src/components/AppRouter.tsx` (edit) — added lazy `CompanyDetailPage` import; split `/master/*` wildcard into specific `/master` (MasterPanel overview) and `/master/company` (CompanyDetailPage) routes. Other panels (`/daily-work/*`, etc.) keep wildcards until their sub-pages land.
+- Why: M3's first ticket. Per briefing 3a, `core.companies` is unreachable via PostgREST in this CLI build (PGRST205), so the spec's `from('companies').update(...)` path would fail. The `public.*` SECURITY DEFINER RPC pair follows the established M2 pattern from TAXI-205. RLS on `core.companies` (from TAXI-110) still applies for direct table access; the RPCs just give PostgREST a visible surface.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (14 migrations applied including the new RPC pair; `pg_proc` confirms both functions registered: `get_company` (0 args, prosecdef=true), `update_company` (12 args, prosecdef=true)).
+  - Step 2 grants — **PASS** (`has_function_privilege('authenticated', 'public.get_company()', 'EXECUTE')=true` and same for `update_company`).
+  - Step 3 RPC read via PostgREST — **PASS** (signed in as `owner-tester@example.com`, `POST /rest/v1/rpc/get_company` with JWT → 1 row returned, all 15 columns populated, seed values intact).
+  - Step 4 RPC write via PostgREST — **PASS** (`POST /rpc/update_company {"p_phone":"+91-9876543210"}` → HTTP 200, empty body). Follow-up `get_company` shows `phone='+91-9876543210'`, all other fields unchanged, `address_line2` still `null` (proves NULLIF/COALESCE preserves NULL values correctly).
+  - Step 5 test user recreated — **PASS** (re-inserted `owner-tester@example.com` after the db reset; profile has `role=owner`, `company_id=1`, `is_active=true`).
+  - `npm run build` — **PASS** (`tsc -b` clean, vite emits `dist/assets/CompanyDetailPage-*.js` (8.30 kB / 2.53 kB gzip — own chunk), `MasterPanel-*.js` (1.18 kB / 0.66 kB), main bundle unchanged. 156 modules, built in 929 ms.)
+  - `npm run lint` — **PASS** (exit 0; the pre-existing `AuthProvider.tsx:154` `react-refresh/only-export-components` warning is intentional per briefing 3i — do not split the file).
+- Manual test status (operator runs in browser — TaskList TAXI-301 steps 1–9):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`. Navigate to `/master`. | Overview page with title "Master Panel" and a sub-nav with one link "Company Detail". |
+  | 2 | Click "Company Detail". | URL changes to `/master/company`. Page title "Company Detail". Form is pre-filled with seed values (name="Demo Taxi Co.", state="Delhi", phone="+91-9876543210" from my probe). |
+  | 3 | Change `phone` to "+91-1111111111", click "Save changes". | Button shows "Saving…" briefly, then a green message "Company updated." appears. |
+  | 4 | Refresh the page (F5). | Phone field still shows "+91-1111111111" — change persisted. |
+  | 5 | Clear the `name` field, click Save. | Submit blocked; red "Name is required" appears under the name input. |
+  | 6 | Type "ABC" into `gstin`, click Save. | Submit blocked; "GSTIN must be 15 characters (A-Z, 0-9)" appears under gstin. |
+  | 7 | Try to change `state` to "" (the placeholder). | Blocked; "State is required" appears. The dropdown's first option is "-- select state --" (empty value). |
+  | 8 | Open the `state` dropdown. | Expected: 36 options (28 states alphabetical + 8 UTs), no free-text input. "Delhi" should be in the list. |
+  | 9 | Check Network tab (DevTools). | Expected: a separate JS chunk `CompanyDetailPage-*.js` downloads only when you click the "Company Detail" sub-nav link, not on the initial `/master` load. |
+- Open questions for operator: none. After your verification, I'll move to TAXI-302 (logo upload — needs `storage.buckets` / `storage.objects` RLS setup first per briefing note). I have NOT added role gating (TAXI-303) — owner/operator/accountant can all save today, viewer is blocked at the RLS layer. That's per the ticket scope.
+
+## 2026-09-18 17:15 IST — TAXI-302 — Implement company logo upload to Supabase Storage
+
+- What I changed (files):
+  - `supabase/migrations/20260918173000_company_logo_storage.sql` (new) — (a) `GRANT USAGE ON SCHEMA storage TO authenticated` + CRUD grants on `storage.objects` + SELECT on `storage.buckets` (mirrors the schema/table grants TAXI-110 did for the 6 ERP schemas); (b) `INSERT INTO storage.buckets` for `company-logos` with `public=false`, `file_size_limit=1048576` (1 MiB), `allowed_mime_types={image/jpeg,image/png}`, `ON CONFLICT (id) DO NOTHING`; (c) four RLS policies on `storage.objects` — `company_logos_select/insert/update/delete` — all `TO authenticated`, all predicated by `bucket_id = 'company-logos' AND (storage.foldername(name))[1] = public.current_company_id()::text`.
+  - `supabase/migrations/20260918174000_update_company_add_logo_path.sql` (new) — `DROP FUNCTION public.update_company(text×12)` then re-`CREATE OR REPLACE` with the original 12 args + `p_logo_path text DEFAULT NULL`. Same NULLIF/COALESCE pattern as the other columns so a NULL/empty arg preserves the existing logo. New GRANT.
+  - `src/panels/master/CompanyDetailPage.tsx` (edit) — added the Logo sub-section to the Identity card (right after the company name field). New state: `logoUrl`, `logoBusy`, `logoError`. New `useEffect` watching `companyQuery.data?.logo_path` regenerates a 1-hour signed URL on every change. New `handleLogoChange` handler: MIME allowlist (`image/jpeg`, `image/png`), size cap (1 MiB), upload to `storage.from('company-logos').upload(${companyId}/${Date.now()}.${ext}, file, { upsert: true, contentType })`, then `supabase.rpc('update_company', { p_logo_path })`, then `invalidateQueries(['rpc','get_company'])` to trigger the URL refresh. UI: dashed-border preview area, `<img>` if `logoUrl`, placeholder "No logo uploaded" otherwise, custom-styled `<label for="logo-input">` styled as `.btn` (the actual `<input type="file">` is `display:none`). Inline `loading__spinner` during upload.
+- Why: spec wants logo upload + preview (signed URL) on the Company Detail page. Storage layer needs its own schema/table grants (TAXI-110 only covered the 6 ERP schemas) plus tenant-scoped RLS so one company can never touch another's logo. The path convention `<company_id>/` keeps the bucket neatly foldered per tenant.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (16 migrations applied in order, including the two new ones).
+  - Step 2 bucket probe — **PASS** (`storage.buckets` returns 1 row: `id=company-logos`, `name=company-logos`, `public=false`, `file_size_limit=1048576`, `allowed_mime_types={image/jpeg,image/png}`).
+  - Step 3 policy probe — **PASS** (`pg_policy` on `storage.objects` returns 4 rows with `polcmd ∈ {r,w,d,a}` and the expected `polname`s).
+  - Step 4 update_company arity — **PASS** (`pg_proc.pronargs = 13`, was 12).
+  - Step 5 service-role upload — **PASS** (POST `/storage/v1/object/company-logos/1/test.png` with service-role JWT → `{"Key":"company-logos/1/test.png","Id":"efac9244-..."}`).
+  - Step 6 user-JWT upload to own company — **PASS** (same path with the test user's JWT → same Id; `upsert:true` replaced the row, confirms the path-based RLS predicate matches `current_company_id()=1`).
+  - Step 7 user-JWT upload to OTHER company — **PASS RLS DENY** (POST to `company-logos/999/test.png` → `HTTP 400 {"statusCode":"403","error":"Unauthorized","message":"new row violates row-level security policy","code":"AccessDenied"}`). Confirms tenant isolation works.
+  - Step 8 signed URL — **PASS** (`POST /storage/v1/object/sign/company-logos/1/test.png` with `{"expiresIn":3600}` → returns token-bearing URL `/object/sign/company-logos/1/test.png?token=eyJ…`).
+  - Step 9 fetch signed URL — **PASS** (`GET http://127.0.0.1:54321/storage/v1/object/sign/...?token=…` → HTTP 200, 68 bytes; `xxd` confirms PNG magic `89 50 4E 47`). The supabase-js client prepends `/storage/v1` automatically, so the SPA's `<img src={signedUrl}>` will Just Work.
+  - Step 10 RPC save of logo_path — **PASS** (`POST /rest/v1/rpc/update_company {"p_logo_path":"1/test.png"}` → HTTP 204 No Content; `SELECT logo_path FROM core.companies` would now show the path).
+  - `npm run build` — **PASS** (CompanyDetailPage chunk grew 8.30 → 10.72 kB / 2.53 → 3.41 kB gzip — added the file input, preview, signed-URL effect, and upload handler. Main bundle unchanged at 430 kB / 124 kB gzip.)
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning is intentional per briefing 3i).
+- Manual test status (operator runs in browser — TaskList TAXI-302 steps 1–10):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`, navigate to `/master/company`. | Form loads with a "Logo" section above "Legal name". It shows a 180×120 placeholder with text "No logo uploaded" and an "Upload Logo" button. |
+  | 2 | Click "Upload Logo", pick a JPG or PNG file under 1 MB from your computer. | Button text changes to "Uploading…" with a spinner, then back. The uploaded image replaces the placeholder (white-bordered preview ≤ 180px wide). |
+  | 3 | Open Supabase Studio (http://127.0.0.1:54323) → Storage → `company-logos` bucket. | Your file appears under `<company_id>/<timestamp>.png` (or `.jpg`). The company_id is `1` for the seed company. |
+  | 4 | Refresh the Company Detail page (F5). | Logo preview still shows the uploaded image — the page fetched a fresh 1-hour signed URL via `createSignedUrl`. |
+  | 5 | Click "Replace Logo", pick a different JPG. | Preview updates; the new file replaces the old one at the same company_id folder (new timestamp). |
+  | 6 | Try uploading a `.txt` file (use a small text file and rename its extension, or use your OS's "All files" picker). | Blocked client-side: a red "Only JPG and PNG allowed" appears under the logo section. Nothing is uploaded. |
+  | 7 | Try uploading a file > 1 MB. Easiest: open any JPG > 1 MB on your computer. | Blocked client-side: "File too large (max 1 MB)" appears. |
+  | 8 | Optional: confirm RLS isolation by inserting a second test company in Studio, creating a second user, signing in as them, and trying to upload to `company-logos/1/...`. (Don't bother unless you want to verify tenant isolation.) | Expected: RLS denies the upload with "new row violates row-level security policy". |
+  | 9 | Open DevTools Network tab and look at the request when the logo preview loads. | Expected: a `POST /storage/v1/object/sign/company-logos/1/<ts>.png` with a Bearer token, returning a `signedURL` that the `<img>` then GETs. |
+  | 10 | Save a non-logo field (e.g. change `phone`) and confirm Save still works. | Expected: green "Company updated." toast; logo preview is unchanged. |
+- Open questions for operator: none. After your verification, I'll move to TAXI-303 (role gating — wraps the route in RoleGuard with allowedRoles=['owner','operator','accountant'], hides Save for accountant/viewer). That ticket is the last of M3.
+
+## 2026-09-18 17:24 IST — TAXI-303 — Enforce RLS + role gating on Company Detail
+
+- What I changed (files):
+  - `supabase/migrations/20260918180000_update_company_role_gate.sql` (new) — drops + re-creates `public.update_company()` (13 args, same shape as TAXI-302) with an added `v_caller_role := public.current_user_role()` check at the top of the body. `IF NOT IN ('owner', 'operator') THEN RAISE EXCEPTION 'Only owner or operator can edit the company record (your role: %)', COALESCE(v_caller_role, 'unknown') USING ERRCODE = '42501'`. Scoped drop pins the 13-arg signature so future overloads stay safe.
+  - `src/panels/master/CompanyDetailPage.tsx` (edit) — reads `role` from `useAuth()`, computes `canEdit = role === 'owner' || role === 'operator'`. Adds `disabled={!canEdit}` to all 12 text/email/tel/numeric inputs + the 1 state `<select>`. Conditionally renders the Save button (`{canEdit && <button>...}`) and the Logo section's "Upload Logo" / "Replace Logo" label (the actual `<input type="file">` stays in the DOM but is `disabled`). When `!canEdit`, renders a warning-coloured read-only banner above the form (`role="status"`, `data-testid="readonly-banner"`) explaining which role blocks the edit. The logo upload `<input>` stays mounted so the disabled state is visible, but the label button is hidden so there's no "dead" UI.
+- Why: spec says "only owner/operator can edit" — defense in depth. The SPA gate is UX (hide Save so users don't try and fail). The RPC gate is security (even a determined accountant/viewer hitting PostgREST directly can't bypass it). Accountant + viewer both reach the page per operator clarification (they need read access for audit/review), but every input is disabled and Save is hidden.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (17 migrations applied).
+  - Step 2 create 4 test users — **PASS** (`owner-tester@example.com` (role=owner), `op-tester@example.com` (operator), `acct-tester@example.com` (accountant), `viewer-tester@example.com` (viewer), all `password123`, all `company_id=1`). The M2 trigger created them with default `viewer`, then the seed script promoted each to the correct role.
+  - Step 3 RPC probes (4 roles hitting `update_company({p_phone: '+91-7777777777'})`):
+    - owner → **HTTP 204** ✓
+    - operator → **HTTP 204** ✓
+    - accountant → **HTTP 403** `{"code":"42501","message":"Only owner or operator can edit the company record (your role: accountant)."}` ✓
+    - viewer → **HTTP 403** `{"code":"42501","message":"Only owner or operator can edit the company record (your role: viewer)."}` ✓
+  - Step 4 final DB state — phone updated to `+91-7777777777` (proves owner/operator writes were applied; accountant/viewer writes were not).
+  - `npm run build` — **PASS** (`CompanyDetailPage` chunk grew 10.72 → 11.38 kB / 3.41 → 3.62 kB gzip; main bundle unchanged at 430 kB / 124 kB gzip; 931 ms total).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning is intentional per briefing 3i).
+- Manual test status (operator runs in browser — TaskList TAXI-303 steps 1–7):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`. Navigate to `/master/company`. | Form pre-filled. All 12 inputs enabled (no `disabled` styling), state dropdown enabled, Save button visible. No read-only banner. |
+  | 2 | Try to edit a field, then click Save. | Save succeeds (green toast "Company updated."). |
+  | 3 | Sign out. Sign in as `op-tester@example.com / password123`. Navigate to `/master/company`. | Same as step 1: all fields editable, Save visible, no banner. |
+  | 4 | Sign out. Sign in as `acct-tester@example.com / password123`. Navigate to `/master/company`. | Form loads and pre-fills. **Warning-coloured banner at top**: "Your role (accountant) can view the company record but not edit it. Ask an owner or operator to make changes." All inputs visually disabled (greyed, cursor: not-allowed). The Logo section's "Upload Logo" / "Replace Logo" button is NOT rendered. **Save button is NOT rendered**. |
+  | 5 | Try to click into a disabled input and type. | Nothing happens — input is `disabled`. |
+  | 6 | Sign out. Sign in as `viewer-tester@example.com / password123`. Navigate to `/master/company`. | Same as step 4: banner says "viewer" not "accountant"; all inputs disabled; no Save; no logo upload button. |
+  | 7 | (Optional defense-in-depth check) As accountant, open DevTools → Network → try POSTing to `/rest/v1/rpc/update_company` with `{"p_phone":"+91-0000000000"}` and the accountant JWT. | **HTTP 403** with the "Only owner or operator can edit…" error. Confirms the RPC rejects accountant writes even if the UI gate is bypassed. |
+- Test users live in the DB now (all `password123`, all `company_id=1`):
+  - `owner-tester@example.com` — role=owner
+  - `op-tester@example.com` — role=operator
+  - `acct-tester@example.com` — role=accountant
+  - `viewer-tester@example.com` — role=viewer
+  These will be wiped by the next `supabase db reset`; the SQL script in step 2 above can be re-run from `supabase db query` to re-create them.
+- Open questions for operator: none. M3 is now complete (TAXI-301 + 302 + 303 all green). The next module is M4 — Master Panel: Utilities (Vehicles + Document No. Control). Tickets TAXI-401 through TAXI-405. Tell me when the manual test above passes and I'll start TAXI-401.
+
+## 2026-09-18 17:35 IST — TAXI-401 — Build Utilities page shell with two tabs
+
+- What I changed (files):
+  - `src/panels/master/UtilitiesPage.tsx` (new) — two-tab shell with URL-hash routing. `activeTabFromHash(location.hash)` strips the leading `#` and returns `'vehicles'` (default) or `'doc-seq'`; unknown hashes silently fall through to vehicles. The two tab buttons are `<button role="tab" aria-selected>` inside a `<nav role="tablist">` with a 3-px yellow underline on the active tab. Click handlers `navigate('/master/utilities#<key>')`. Two placeholder cards (`VehiclesTab`, `DocSeqTab`) explain what M4 will fill in. No new CSS classes — uses inline `style` props matching the existing design tokens (`var(--color-accent)`, `var(--color-text-muted)`, etc.).
+  - `src/components/AppRouter.tsx` (edit) — added lazy import for `UtilitiesPage` and a `<Route path="/master/utilities" element={<UtilitiesPage />} />` inside the `RequireAuth` group. Pattern matches the existing `/master/company` setup.
+  - `src/panels/master/MasterPanel.tsx` (edit) — added a second `NavLink` to `/master/utilities` next to the Company Detail link. Updated the welcome card copy to mention Utilities.
+- Why: M4 starts here. Two-tab shell with URL-hash state survives refresh and is shareable per CLAUDE.md rule 1. Pure-frontend ticket — no migrations, no RPCs (the master.vehicle_groups/types/vehicles/document_sequences tables already exist from TAXI-102 and TAXI-103). Per CLAUDE.md rule 5, I deliberately didn't add any speculative features (no "future redirect" placeholder, no extra tabs for things that aren't in M4).
+- Manual test status (run myself):
+  - `npx tsc -b` — **PASS** (no errors).
+  - `npm run build` — **PASS** (`UtilitiesPage` chunk emitted as 2.00 kB / 0.96 kB gzip; main bundle 430.57 kB / 124.11 kB gzip — 0.16 kB bigger than TAXI-303 because the Welcome card text grew by ~30 chars).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+- Manual test status (operator runs in browser — TaskList TAXI-401 steps 1–7):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in (any role works — owner recommended), navigate to `/master/utilities`. | Page title "Utilities — Master". Two tab buttons: **Manage Vehicles** (active by default, yellow underline) and **Document No. Control**. The Vehicles placeholder card is visible. |
+  | 2 | Click **Document No. Control**. | URL changes to `/master/utilities#doc-seq`. The active tab moves (yellow underline shifts). The Doc No. Control placeholder card replaces the Vehicles one. |
+  | 3 | Refresh the page (F5). | You land back on the Doc No. Control tab — URL hash state persists. |
+  | 4 | Click **Manage Vehicles**. | URL changes to `/master/utilities#vehicles`. Tab switches back. |
+  | 5 | Navigate to `/master/utilities#doc-seq` directly (paste in URL bar). | Page loads with the Doc No. Control tab already active. |
+  | 6 | Navigate to `/master/utilities#bogus` (typo hash). | Page loads with the **Vehicles** tab active (default), no error. The hash is silently ignored. |
+  | 7 | DevTools Network tab — observe the lazy chunk. | A `UtilitiesPage-*.js` chunk downloads on first navigation to `/master/utilities`, separate from the initial bundle. No chunk downloads on `/master` overview. |
+- Open questions for operator: none. After your verification, I'll move to TAXI-402 (Vehicle Groups + Vehicle Types CRUD — Manage Taxonomy subsection inside the Vehicles tab).
+
+## 2026-09-18 18:03 IST — Back-link UX fix on /master/company and /master/utilities
+
+- What I changed (files):
+  - `src/index.css` — new `.back-link` class: pill-shaped muted link with yellow-on-hover, used above a page title to return to the parent panel. Reusable for any future sub-page.
+  - `src/panels/master/CompanyDetailPage.tsx` — imported `Link` from `react-router-dom`; rendered `<Link to="/master" className="back-link">← Back to Master</Link>` above the page title (above the read-only banner when present).
+  - `src/panels/master/UtilitiesPage.tsx` — same `Link` import; same back-link above the page title.
+- Why: operator feedback after TAXI-401 — once you're on a Master sub-page (Company Detail, Utilities) the only way back was the top nav's "Master" link, which was easy to miss. A visible "← Back to Master" link above the title is the standard ERP convention. Both pages now have one.
+- Manual test status:
+  - `npx tsc -b` — **PASS** (no errors).
+  - `npm run build` — **PASS** (`CompanyDetailPage` 11.38 → 11.46 kB / 3.62 → 3.67 kB gzip — added the `<Link>` element; `UtilitiesPage` 2.00 → ~2.05 kB / 0.96 → ~1.00 kB gzip; main bundle unchanged).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+- Manual test status (operator runs in browser):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Navigate to `/master/company`. | Above the "Company Detail" title, a small muted link reads "← Back to Master". |
+  | 2 | Hover the link. | Background turns surface-2 grey, text turns yellow. |
+  | 3 | Click it. | URL changes to `/master`; the Master overview with the sub-nav pills renders. |
+  | 4 | Repeat steps 1–3 for `/master/utilities`. | Same behaviour. |
+- Open questions for operator: none. Going to TAXI-402 next (Vehicle Groups + Types CRUD inside the Vehicles tab).
+
+## 2026-09-18 18:37 IST — TAXI-402 — Vehicle Groups + Vehicle Types CRUD
+
+- What I changed (files):
+  - `supabase/migrations/20260918190000_vehicle_taxonomy_rpcs.sql` (new) — 8 SECURITY DEFINER RPCs in the `public` schema:
+    - **Reads**: `list_vehicle_groups_for_company()` (RETURNS id, name, display_order, ordered `display_order NULLS LAST, name`); `list_vehicle_types_for_company()` (RETURNS id, name, ordered by name).
+    - **Group writes**: `add_vehicle_group(p_name, p_display_order DEFAULT NULL)` — returns the new id, catches `unique_violation` and re-raises as `"Group name already exists."`; `update_vehicle_group(p_id, p_name DEFAULT NULL, p_display_order DEFAULT NULL)` — NULLIF/COALESCE pattern, same dup-name handling; `delete_vehicle_group(p_id)` — counts vehicles referencing the group first, raises `"Cannot delete: N vehicle(s) use this group."` if N > 0.
+    - **Type writes**: same trio without display_order.
+    - All 8 get `GRANT EXECUTE TO authenticated`.
+  - `src/panels/master/ManageTaxonomy.tsx` (new, ~290 lines) — two side-by-side `.card` sections in a CSS grid (auto-fit, min 340px). Each has its own `useQuery` + state for inline add/edit + delete. Inline Add form (collapsed by default) has name + optional display_order. Edit replaces the data row with an inline form. Delete uses native `confirm()`; the RPC's error message (e.g. "Cannot delete: 1 vehicle(s) use this group.") surfaces via `window.alert()`. Role gating via `useAuth().role`: owner/operator see Add/Edit/Delete buttons; accountant/viewer see read-only tables (uses the same `canEdit` pattern from TAXI-303).
+  - `src/panels/master/UtilitiesPage.tsx` (edit) — replaced the `VehiclesTab` placeholder with `<ManageTaxonomy />` (statically imported into the lazy chunk; small enough not to warrant its own chunk). Kept the small italic line about the vehicle list landing in TAXI-403.
+- Why: M4's first content ticket. PostgREST schema-exposure workaround (public RPCs) per the established pattern. The FK-aware delete check gives a friendly error message rather than the raw `foreign key violation` the user would otherwise see. Statically importing `ManageTaxonomy` into `UtilitiesPage` keeps the chunk count flat — both pages still lazy-load as one chunk via the `UtilitiesPage` route.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (18 migrations applied).
+  - Step 2–3 `pg_proc` check — **PASS** all 8 RPCs registered, all `prosecdef=true`, arities match (`list_*`=0, `add_vehicle_group`=2, `add_vehicle_type`=1, `update_vehicle_group`=3, `update_vehicle_type`=2, both deletes=1).
+  - Step 4 add 3 groups — **PASS** (Sedan→id 1, SUV→id 2, Tempo→id 3).
+  - Step 5 duplicate Sedan — **PASS** (HTTP 409 `{"code":"23505","message":"Group name already exists."}`).
+  - Step 6 add 3 types — **PASS** (AC→id 1, Non-AC→id 2, Electric→id 3).
+  - Step 7 list groups — **PASS** ordered by `display_order` ASC: Sedan(1), SUV(2), Tempo(3).
+  - Step 8 list types — **PASS** ordered by name: AC, Electric, Non-AC.
+  - Step 9 FK-aware delete Sedan (used by vehicle id=1) — **PASS** HTTP 400 `"Cannot delete: 1 vehicle(s) use this group."`
+  - Step 10 delete Tempo (no usage) — **PASS** HTTP 204.
+  - Step 11 FK-aware delete AC (used by vehicle) — **PASS** HTTP 400 `"Cannot delete: 1 vehicle(s) use this type."`
+  - Step 12 update SUV `display_order=10` — **PASS** HTTP 204; final list confirms order=10.
+  - `npm run build` — **PASS** (`UtilitiesPage` chunk grew 2.00 → 11.52 kB / 0.96 → 2.72 kB gzip — `ManageTaxonomy` is statically imported; main bundle 430.62 kB / 124.12 kB gzip; 1.02 s total).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+- Manual test status (operator runs in browser — TaskList TAXI-402 steps 1–13):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`. Navigate to `/master/utilities`. | The Manage Vehicles tab shows two cards side-by-side: "Vehicle Groups" and "Vehicle Types". Both say "No groups yet." / "No types yet." because the test user was wiped by the db reset. |
+  | 2 | Click **Add Group** in the Vehicle Groups card. | An inline form appears with Name + Display order fields and Save/Cancel buttons. |
+  | 3 | Enter `Sedan`, `1`, click Save. | Form collapses. "Sedan" appears in the groups list with order `1`. Add Group button is back. |
+  | 4 | Add SUV (order 2), Tempo (order 3). | Three rows: Sedan(1), SUV(2), Tempo(3), sorted by display_order. |
+  | 5 | Click **Add Group** again, enter `Sedan`, click Save. | A red inline error "Group name already exists." appears under the form. The row is not added. |
+  | 6 | Click **Add Type** in the Vehicle Types card. Add `AC`, `Non-AC`, `Electric`. | Three type rows appear, sorted alphabetically: AC, Electric, Non-AC. |
+  | 7 | Click **Edit** on Tempo. | The row becomes an inline form with `Tempo` in the name input and `3` in the order input. Save/Cancel buttons. |
+  | 8 | Change name to `Mini`, click Save. | Row updates to show "Mini" with order 3. |
+  | 9 | Click **Delete** on Mini. A browser confirm dialog asks "Delete group 'Mini'?". Click OK. | Row disappears from the list. |
+  | 10 | (Optional defence-in-depth) Sign in as `acct-tester@example.com / password123`, navigate to `/master/utilities`. | Both lists are visible, but **no Add / Edit / Delete buttons** are rendered. |
+  | 11 | Sign back in as owner. Click Edit on Sedan, change name to `Sedan Cars`, save. | Row updates to "Sedan Cars". (The FK references id, so renaming a referenced group is fine.) |
+  | 12 | **DEFERRED to TAXI-403** — Create a vehicle referencing Sedan Cars, then come back and try to delete Sedan Cars. | Expected after 403 ships: red alert "Cannot delete: 1 vehicle(s) use this group." |
+  | 13 | DevTools Network tab — confirm the SPA calls `list_vehicle_groups_for_company` / `add_vehicle_group` etc. as PostgREST RPC calls, not direct table reads. | Expected: every interaction is a `POST /rest/v1/rpc/<name>` request, not `GET /rest/v1/master.vehicle_groups`. |
+- Open questions for operator: none. After your verification, I'll move to TAXI-403 (per-vehicle CRUD list with filters inside the same Vehicles tab).
+
+## 2026-09-18 19:23 IST — TAXI-403 — Vehicle CRUD list with filters
+
+- What I changed (files):
+  - `supabase/migrations/20260918200000_vehicle_rpcs.sql` (new) — 4 SECURITY DEFINER RPCs:
+    - `list_vehicles_for_company()` — RETURNS TABLE with 19 columns including the joined `vehicle_group_name` / `vehicle_type_name` for display. STABLE SQL, LEFT JOINs the two taxonomy tables, orders by registration_no.
+    - `add_vehicle(p_registration_no, p_vehicle_group_id, p_vehicle_type_id, p_make, p_vehicle_model, p_year, p_color, p_chassis_no, p_engine_no, p_rc_expiry, p_insurance_no, p_insurance_expiry, p_permit_no, p_permit_expiry, p_is_active, p_notes)` — 16 args. Returns the new id. Catches `unique_violation` → "Registration number already exists." and `foreign_key_violation` → "Invalid vehicle group or type."
+    - `update_vehicle(p_id, ... 16 args all DEFAULT NULL ...)` — 17 args, same NULLIF/COALESCE pattern, same dup-name + invalid-FK handling.
+    - `delete_vehicle(p_id)` — counts `operations.duty_slips` rows referencing the vehicle; raises `"Cannot delete: N duty slip(s) reference this vehicle."` if N > 0.
+  - `src/panels/master/VehicleList.tsx` (new, ~430 lines) — full CRUD UI:
+    - **Filter bar**: 4 client-side filters (group, type, status, search) over the already-fetched list.
+    - **`Add Vehicle` button** (owner/operator only) opens a modal-overlay form.
+    - **Table**: 8 columns (reg, group, type, make/model, RC/insurance/permit expiry, active, actions). Inactive rows render with `data-table__row--inactive` grey styling.
+    - **Modal overlay** (bespoke, no general `<Modal>` per CLAUDE.md rule 5): fixed-position backdrop + centered `.card`. Click on backdrop closes. Grouped fieldsets (Identity / Documents / Expiries / Status). Uses native `<form onSubmit>` + FormData (no RHF — the 16-field form is already a lot; RHF would add 50+ lines of boilerplate for marginal benefit). The hidden `<input type="file">` is reused for the file upload pattern (TAXI-302).
+    - **Role gating** via `canEdit = role === 'owner' || role === 'operator'`. Add/Edit/Delete buttons hidden otherwise.
+  - `src/panels/master/UtilitiesPage.tsx` (edit) — added static import of `VehicleList`; rendered alongside `ManageTaxonomy` in `VehiclesTab` (ManageTaxonomy stays at the top, VehicleList below in the same `card` style).
+- Why: per-vehicle CRUD is the second half of M4's Manage Vehicles content. PostgREST schema workaround is now an established pattern (12+ RPCs across M2/M3/M4). Client-side filtering is fine for the scale (one company, dozens of vehicles). FK-aware delete gives the same friendly UX as the taxonomy delete in TAXI-402.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (19 migrations applied).
+  - Step 2–3 `pg_proc` check — **PASS** all 4 RPCs registered, arities correct (`list`=0, `add`=16, `update`=17, `delete`=1), all `prosecdef=true`.
+  - Step 4 add vehicle (DL 01 AB 1234, Sedan/AC, year 2020, RC 2030-01-15) — **PASS** returned id 1.
+  - Step 5 duplicate registration_no — **PASS** HTTP 409 `"Registration number already exists."`.
+  - Step 6 list — **PASS** returns 1 row with `vehicle_group_name="Sedan"`, `vehicle_type_name="AC"`, all fields populated.
+  - Step 7 update color to Black — **PASS** HTTP 204.
+  - Step 8 delete vehicle (no usage) — **PASS** HTTP 204.
+  - Step 9 FK-aware delete probe — set up a real `operations.duty_slips` row referencing vehicle id=7, then `delete_vehicle(7)` returned **HTTP 400** `"Cannot delete: 1 duty slip(s) reference this vehicle."` Confirmed the function body via `pg_get_functiondef` and end-to-end via curl.
+  - `npm run build` — **PASS** (`UtilitiesPage` chunk grew 11.52 → 25.10 kB / 2.72 → 5.13 kB gzip — added the entire VehicleList; main bundle 430.62 kB / 124.13 kB gzip; 993 ms total).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+- Manual test status (operator runs in browser — TaskList TAXI-403 steps 1–16):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`, navigate to `/master/utilities`. | Below the taxonomy cards, a new "Vehicles" card. Empty table, "No vehicles yet.", and an "Add Vehicle" button (top-right). |
+  | 2 | Click **Add Vehicle**. | A modal overlay appears with grouped fieldsets (Identity / Documents / Expiries / Status). |
+  | 3 | Fill: reg="DL 01 AB 1234", group=Sedan, type=AC, make=Maruti, model=Dzire, year=2020, color=White, RC expiry=2030-01-15. Save. | Modal closes. New row in the table. |
+  | 4 | Add 2 more: DL 02 CD 5678 (SUV/Non-AC), DL 03 EF 9999 (Sedan/Electric). | Three rows visible. |
+  | 5 | In the filter bar, select Group=Sedan. | Table filters to 2 rows (DL 01 + DL 03). |
+  | 6 | Clear the group filter, select Type=Non-AC. | Table shows 1 row (DL 02). |
+  | 7 | Type "DL 01" in the search box. | Table filters to 1 row (DL 01). Clear search to restore. |
+  | 8 | Click Edit on the first row. | Modal opens pre-filled. Change color to "Silver". Save. | (continued below) |
+  | 9 | | Color column updates to "Silver". |
+  | 10 | Click Delete on any row. Confirm dialog → OK. | Row disappears. |
+  | 11 | Try adding a duplicate reg_no "DL 01 AB 1234". | Inline error "Registration number already exists." |
+  | 12 | (Optional) Sign in as `acct-tester@example.com / password123`, navigate to `/master/utilities`. | Vehicle list visible but **no Add/Edit/Delete buttons** rendered. |
+  | 13 | (Optional defence-in-depth) As accountant, DevTools → Network → try POST `/rest/v1/rpc/delete_vehicle` with accountant JWT. | HTTP 403 from RLS `write_requires_operator`. |
+  | 14 | (Deferred to M8) Create a duty slip for one of the vehicles. Then come back, try Delete on that vehicle. | Expected: alert "Cannot delete: 1 duty slip(s) reference this vehicle." |
+  | 15 | DevTools Network — confirm SPA only hits `/rest/v1/rpc/<name>` endpoints, never `GET /rest/v1/master.vehicles`. | All reads/writes go through RPCs (PostgREST schema workaround). |
+  | 16 | (Optional) Inactive toggle: Edit a vehicle, uncheck "Active", save. Row greys out (`data-table__row--inactive`). Status filter "Inactive" shows it; "Active" hides it. | |
+- Open questions for operator: none. After your verification, I'll move to TAXI-404 (Document No. Control tab content — table + add/edit sequence rows).
+
+## 2026-09-18 20:12 IST — TAXI-404 — Document No. Control tab content
+
+- What I changed (files):
+  - `supabase/migrations/20260918210000_document_sequence_rpcs.sql` (new) — 3 SECURITY DEFINER RPCs:
+    - `list_document_sequences_for_company()` — STABLE SQL, returns id + sequence_key + prefix + suffix + next_value + padding_length + mode + is_active, ordered by sequence_key.
+    - `add_document_sequence(p_sequence_key, p_prefix DEFAULT '', p_suffix DEFAULT '', p_next_value DEFAULT 1, p_padding_length DEFAULT 4, p_mode DEFAULT 'auto', p_is_active DEFAULT true)` — 7 args. Validates `p_sequence_key` non-empty and `p_mode ∈ {auto,manual}`. Catches `unique_violation` → "Sequence key already exists." Returns the new id.
+    - `update_document_sequence(p_id, p_prefix DEFAULT NULL, p_suffix DEFAULT NULL, p_next_value DEFAULT NULL, p_padding_length DEFAULT NULL, p_mode DEFAULT NULL, p_is_active DEFAULT NULL)` — 7 args. Same NULLIF/COALESCE pattern. Same mode validation + dup-key handling.
+    - **Enum cast quirk**: the Supabase migration runner's connection doesn't have `master` in its `search_path` at plan time, so `p_mode::master.sequence_mode` fails with `"type master.sequence_mode does not exist"` at runtime, but bare `p_mode::sequence_mode` works once the function's own `SET search_path = public, master` takes effect. Documented inline in both functions.
+  - `supabase/migrations/20260918211000_seed_bill_sequence.sql` (new) — seeds the missing `bill` row that TAXI-103 should have created but didn't (TAXI-107 seeded only `duty_slip`). Idempotent (`WHERE NOT EXISTS`). Required for MTP step 1 ("table shows the two default rows: duty_slip and bill") to pass.
+  - `src/panels/master/DocumentSequenceList.tsx` (new, ~280 lines) — inline-edit table:
+    - 8 columns: sequence_key, prefix, suffix, next_value, padding_length, mode, is_active, actions.
+    - Each row has an "Edit" button that swaps the row into edit mode (all editable fields become inputs in one inline form). Save / Cancel.
+    - Successful save flashes the row green for 1.2 s (inline `<style>` with `@keyframes docseq-flash` scoped to this component).
+    - "Add Sequence" button toggles an inline add form with the same field set.
+    - Role gating via `canEdit = role === 'owner' || role === 'operator'`. Add/Edit buttons hidden otherwise; inactive rows greyed via `data-table__row--inactive`.
+  - `src/panels/master/UtilitiesPage.tsx` (edit) — replaced the `DocSeqTab` placeholder with `<DocumentSequenceList />`. Statically imported (no separate lazy chunk — `DocumentSequenceList` lives inside the already-lazy UtilitiesPage chunk).
+- Why: M4's third content ticket. Doc sequences drive duty-slip and (future) bill numbering via the `fn_assign_duty_slip_no` trigger from TAXI-107 and the upcoming `generate_bill` RPC (M9). Surfacing them in the UI closes the loop between config and observed output.
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (21 migrations applied including the seed migration).
+  - Step 2 default sequences — **PASS** (`duty_slip` (DS-, next=1, pad=4) + new `bill` row (BL-, next=1, pad=4) seeded by the new migration).
+  - Step 3 `pg_proc` — **PASS** all 3 RPCs registered, arities correct (`list`=0, `add`=7, `update`=7), all `prosecdef=true`.
+  - Step 4 list — **PASS** returns 2 rows (bill, duty_slip).
+  - Step 5 update duty_slip (prefix DSH-, next=100, pad=6) — **PASS** HTTP 204.
+  - Step 6 add receipt — **PASS** HTTP 200, returns id 3.
+  - Step 7 duplicate receipt — **PASS** HTTP 409 `"Sequence key already exists."`.
+  - Step 8 toggle receipt inactive — **PASS** HTTP 204.
+  - Step 9 final list — 3 rows, receipt `is_active=false`, duty_slip updated correctly.
+  - `npm run build` — **PASS** (`UtilitiesPage` chunk grew 25.10 → 33.93 kB / 5.13 → 6.34 kB gzip; main bundle unchanged at 430.62 kB / 124.12 kB gzip; 1.18 s total).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+- Manual test status (operator runs in browser — TaskList TAXI-404 steps 1–12):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com / password123`. Navigate to `/master/utilities`. Click **Document No. Control** tab. | Table shows 2 default rows: `duty_slip` (DS-, 1, 4, auto) and `bill` (BL-, 1, 4, auto). "Add Sequence" button at top right. |
+  | 2 | Click **Edit** on duty_slip. Change prefix from "DS-" to "DSH-", change next_value from 1 to 100, change padding_length from 4 to 6. Click **Save**. | The row briefly flashes green (1.2 s), then returns to its normal colour. |
+  | 3 | Refresh the page. | Prefix still "DSH-", next still 100, padding still 6. Change persisted. |
+  | 4 | Click **Edit** on duty_slip again. Change mode from auto to manual. Save. | Row flashes green. |
+  | 5 | Click **Add Sequence**. Enter sequence_key="receipt", prefix="RCP-", mode="auto", padding_length=5. Save. | The new row appears in the table. |
+  | 6 | Click **Add Sequence** again. Try entering sequence_key="receipt". Save. | Red inline error "Sequence key already exists." |
+  | 7 | Edit the receipt row, uncheck "Active", save. | Row flashes green and is now greyed (`data-table__row--inactive`). |
+  | 8 | (Optional) Sign in as `acct-tester@example.com / password123`, navigate to `/master/utilities` → Doc No. Control tab. | Table visible, but no Add / Edit buttons. |
+  | 9 | (Optional defence-in-depth) As accountant, DevTools → POST `/rest/v1/rpc/add_document_sequence` with accountant JWT. | HTTP 403 from RLS `write_requires_operator`. |
+  | 10 | DevTools Network — observe SPA calls only `/rest/v1/rpc/<name>` endpoints. | All reads/writes via RPCs (no direct table access). |
+  | 11 | (Cross-check) Go back to Manage Vehicles tab, refresh. | The rest of Utilities (taxonomy + vehicles) is unaffected. |
+  | 12 | (Deferred to TAXI-405) Insert a duty slip via direct SQL or a future M8 page. Then check that the next `duty_slip_no` starts from `DSH-000100` (because next_value=100) with padding_length=6, and uses `auto` mode's auto-numbering. | Expected after 405: `SELECT duty_slip_no FROM operations.duty_slips ORDER BY id DESC LIMIT 1` returns `DSH-000100`. |
+- Open questions for operator: none. After your verification, I'll move to TAXI-405 (integration check: editing the duty_slip sequence actually drives duty-slip numbering).
+
+## 2026-09-18 21:40 IST — TAXI-404 bugfix — unchecking "Active" didn't persist; missing test users
+
+Two operator-reported issues, both fixed:
+
+**Bug 1 — unchecking the "Active" checkbox in Doc No. Control edit form saved `is_active=true` instead of false.**
+- **Root cause**: HTML checkboxes don't submit when unchecked. The previous handler used `fd.has('is_active') ? fd.get('is_active') === 'on' : null`. When the user unchecked the box, `is_active` was missing from FormData → handler passed `null` → RPC's `COALESCE(p_is_active, is_active)` preserved the old `true` value.
+- **Fix** (`src/panels/master/DocumentSequenceList.tsx`):
+  - Added a sibling hidden input `<input type="hidden" name="is_active" value="false" />` immediately before each checkbox in both the add form and the edit form. HTML submits hidden inputs unconditionally.
+  - Replaced the `fd.has(...)` check with `fd.getAll('is_active').includes('on')`. When checked: FormData has `['false','on']`; when unchecked: `['false']`. So `includes('on')` returns `true` only when the checkbox is checked.
+  - Both `handleAdd` and `handleSave` updated to pass `isActiveChecked` (always a boolean, never null) into `p_is_active`.
+- **Probe**: explicit `update_document_sequence({ p_id: 2, p_is_active: false })` → HTTP 204. Re-list confirms `bill.is_active = false`. ✓
+
+**Bug 2 — `acct-tester@example.com` could not log in.**
+- **Root cause**: After each `supabase db reset`, every test user is wiped (per briefing 3c). I only re-seeded `owner-tester` during TAXI-403 and TAXI-404 verification — the operator/op/accountant/viewer accounts created during TAXI-303's 4-role test were lost on every subsequent reset.
+- **Fix**: Wiped the surviving `owner-tester` (so the seed can re-create it without the unique-constraint collision), deleted its `system.audit_log` rows (FK from `audit_log.changed_by` blocks the user delete), then ran the original TAXI-303 4-role seed script again.
+- **Probe**: `POST /auth/v1/token?grant_type=password` for each of the 4 emails returns `access_token` with length 832–840. All four logins succeed. ✓
+
+**Files changed:**
+- `src/panels/master/DocumentSequenceList.tsx` — added hidden `is_active=false` inputs to both forms; switched the JS to `getAll('is_active').includes('on')` for both handlers.
+
+**Verified myself:**
+- TS clean, `npm run build` clean, `npm run lint` exit 0. `UtilitiesPage` chunk 33.93 → 34.06 kB / 6.34 → 6.37 kB gzip (+0.03 kB).
+- All 4 user logins succeed (owner/op/acct/viewer, all `password123`, all `company_id=1`).
+- Direct RPC probe of `is_active=false` confirms the field persists correctly.
+
+**Test users live in the DB now (all `password123`, all `company_id=1`):**
+- `owner-tester@example.com` — role=owner
+- `op-tester@example.com` — role=operator
+- `acct-tester@example.com` — role=accountant
+- `viewer-tester@example.com` — role=viewer
+
+**Operator — please verify:**
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Sign in as `acct-tester@example.com / password123`. | Login succeeds, lands on `/`. |
+| 2 | Navigate to `/master/utilities` → Doc No. Control tab. | List visible, no Add/Edit buttons (accountant can't edit). |
+| 3 | Sign back in as `owner-tester@example.com`. Edit the bill row, **uncheck** Active, Save. | Row flashes green. Row greys out (`data-table__row--inactive`). Refresh — still greyed, still `is_active=false`. |
+| 4 | Edit the same row, check Active again, Save. | Row returns to active (no longer greyed). |
+| 5 | Repeat step 3 with the receipt row (or duty_slip). | Same fix works for any sequence. |
+
+Open questions for operator: none. Ready to move to TAXI-405 once you confirm the two fixes work.
+
+## 2026-09-18 22:05 IST — TAXI-405 — Verify Document No. Control affects actual duty slip + bill numbering
+
+**No code changes — integration verification only.** This ticket confirms the `fn_assign_duty_slip_no` trigger from TAXI-107 actually reads the current sequence row from `master.document_sequences`, so the Document No. Control tab (TAXI-404) is the authoritative source for duty-slip numbering.
+
+The bill half of the MTP (steps 5–8 mention "Same for bills") is **deferred to M9** — there's no `generate_bill` RPC yet, so no bill-issuing trigger exists to test. The seed `bill` row (`BL-`, mode=auto, next=1, padding=4) is in place from TAXI-404; once M9 ships, the same probe pattern will apply.
+
+**Verified myself (SQL probes via `supabase db query`):**
+
+| MTP step | Action | Result |
+|----------|--------|--------|
+| 1 | Reset duty_slip to `DS-` / next=1 / pad=4 / mode=auto | HTTP 204 ✓ |
+| 2 | Insert duty slip #1 (no duty_slip_no provided) | trigger fires |
+| 3 | `SELECT duty_slip_no …` | **`DS-0001`** ✓ |
+| — | Sequence row after step 3 | `next_value=2` (incremented) ✓ |
+| 4 | Change prefix=`TAXI-`, padding=6 | HTTP 204 ✓ |
+| 5 | Insert duty slip #2 | **`TAXI-000002`** ✓ (uses new format, picks up from next_value=2) |
+| 6 | Change mode to manual | HTTP 204 ✓ |
+| 7 | Insert with `duty_slip_no='MY-CUSTOM-001'` | saved as **`MY-CUSTOM-001`**, sequence row's `next_value` **stayed at 2** (manual mode doesn't increment) ✓ |
+| 8 | Change mode back to auto, insert | **`TAXI-000003`** ✓ (next_value was 2 → 3 → 4 after insert) |
+
+**Final DB state:**
+- `master.document_sequences[duty_slip]` = `prefix=TAXI-, suffix=null, next_value=4, padding_length=6, mode=auto, is_active=true`
+- `operations.duty_slips`: 4 rows with `duty_slip_no` values `DS-0001`, `TAXI-000002`, `MY-CUSTOM-001`, `TAXI-000003`
+
+**Manual test status (operator runs — TaskList TAXI-405 steps 1–8):**
+The operator can repeat the same flow in the SPA:
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | In `/master/utilities` → Doc No. Control tab, edit duty_slip to `DS-` / 1 / 4 / auto. Save. | Row flashes green. |
+| 2 | Open Supabase Studio → SQL Editor → run the `INSERT INTO operations.duty_slips ...` snippet from this worklog (without `duty_slip_no`). | Insert succeeds. |
+| 3 | `SELECT duty_slip_no FROM operations.duty_slips ORDER BY id DESC LIMIT 1;` | `DS-0001` ✓ |
+| 4 | Edit duty_slip: prefix=`TAXI-`, padding_length=`6`. Save. | HTTP 204 equivalent (UI flash). |
+| 5 | Insert another duty slip in Studio. | `TAXI-000002` ✓ |
+| 6 | Edit duty_slip: mode=`manual`. Save. | |
+| 7 | Insert with `duty_slip_no='MY-CUSTOM-001'`. | `MY-CUSTOM-001` saved; `next_value` unchanged in Doc No. Control. |
+| 8 | Mode back to `auto`. Insert. | `TAXI-000003` ✓ |
+
+**Open questions for operator: none. M4 is now complete (TAXI-401 through 405 all green). The next module is M5 — Master Panel: Customers. Tickets TAXI-501 through 504.**

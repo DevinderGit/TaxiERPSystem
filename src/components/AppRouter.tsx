@@ -31,6 +31,16 @@ const UnauthorizedPage = lazy(() =>
 const MasterPanel = lazy(() =>
   import('../panels/master/MasterPanel').then((m) => ({ default: m.MasterPanel })),
 );
+const CompanyDetailPage = lazy(() =>
+  import('../panels/master/CompanyDetailPage').then((m) => ({
+    default: m.CompanyDetailPage,
+  })),
+);
+const UtilitiesPage = lazy(() =>
+  import('../panels/master/UtilitiesPage').then((m) => ({
+    default: m.UtilitiesPage,
+  })),
+);
 const DailyWorkPanel = lazy(() =>
   import('../panels/dailywork/DailyWorkPanel').then((m) => ({ default: m.DailyWorkPanel })),
 );
@@ -55,7 +65,9 @@ export function AppRouter() {
         {/* Protected panel routes — RequireAuth bounces unauthenticated
             users to /login with a `from` state. */}
         <Route element={<RequireAuth />}>
-          <Route path="/master/*" element={<MasterPanel />} />
+          <Route path="/master" element={<MasterPanel />} />
+          <Route path="/master/company" element={<CompanyDetailPage />} />
+          <Route path="/master/utilities" element={<UtilitiesPage />} />
           <Route path="/daily-work/*" element={<DailyWorkPanel />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
           <Route path="/reports/*" element={<ReportsPanel />} />

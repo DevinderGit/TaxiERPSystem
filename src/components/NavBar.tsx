@@ -1,17 +1,23 @@
-import { NavLink } from 'react-router-dom';
+import { NavLink, useNavigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
 
 /**
- * Top navigation bar. Sticky under a 3px yellow rule that doubles as
- * the brand accent. The brand mark on the left uses a taxi emoji so
- * the Black/Yellow Cab theme is unmistakable even at a glance.
+ * Top navigation bar. Sticky black nav with yellow rule.
  *
- * Each link uses NavLink so React Router applies the active class.
- * Active link is filled yellow with dark text — high contrast, clear
- * affordance for the current panel.
+ * Auth-aware: when a user is signed in, renders a "Sign out" button on
+ * the right. When signed out, hides it.
  */
 export function NavBar() {
+  const { user, signOut } = useAuth();
+  const navigate = useNavigate();
+
   const linkClass = ({ isActive }: { isActive: boolean }) =>
     isActive ? 'app-nav__link app-nav__link--active' : 'app-nav__link';
+
+  const handleSignOut = async () => {
+    await signOut();
+    navigate('/login', { replace: true });
+  };
 
   return (
     <nav className="app-nav" aria-label="Primary">
@@ -36,6 +42,23 @@ export function NavBar() {
       <NavLink to="/reports" className={linkClass}>
         Reports
       </NavLink>
+
+      {user && (
+        <button
+          type="button"
+          onClick={handleSignOut}
+          className="app-nav__link app-nav__link--button"
+          style={{
+            marginLeft: 'auto',
+            background: 'transparent',
+            border: '1px solid var(--color-border)',
+            cursor: 'pointer',
+            color: 'var(--color-text-muted)',
+          }}
+        >
+          Sign out
+        </button>
+      )}
     </nav>
   );
 }

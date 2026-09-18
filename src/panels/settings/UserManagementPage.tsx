@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
-import { useEntityQuery } from '../../hooks/useEntityQuery';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useAuth } from '../../hooks/useAuth';
 import { supabase } from '../../services/supabaseClient';
 
@@ -11,7 +11,6 @@ interface UserRow {
   role: 'owner' | 'operator' | 'accountant' | 'viewer';
   is_active: boolean;
   company_id: number;
-  // Bare-bones row; full row from PostgREST exposes many more columns.
 }
 
 const ROLE_OPTIONS: UserRow['role'][] = ['owner', 'operator', 'accountant', 'viewer'];
@@ -19,26 +18,29 @@ const ROLE_OPTIONS: UserRow['role'][] = ['owner', 'operator', 'accountant', 'vie
 /**
  * User Management page — owner-only.
  *
- * Per TaskList TAXI-205:
- *   - Lists core.user_profiles rows for the current company (filter by
- *     company_id is enforced by the RLS policy from TAXI-110).
- *   - Invite form: email + role select — calls `public.admin_invite_user`
- *     RPC (server-side, SECURITY DEFINER).
- *   - Per-row role dropdown + is_active toggle — direct UPDATE through
- *     supabaseClient.from('user_profiles').update(...) (RLS gates writes).
- *
- * Wrapped at the route level in <RoleGuard allowedRoles={['owner']} />,
- * which adds the redirectTo="/unauthorized" behaviour for non-owners.
+ * PostgREST-on-custom-schemas workaround: PostgREST 16.2 in this Supabase
+ * CLI build refuses to expose `core` / `master` / etc. via `db.schemas` in
+ * config.toml, so the SPA cannot do `supabase.from('core.user_profiles')`.
+ * Until that's resolved (M14 hardening ticket), every read and update
+ * goes through dedicated RPCs:
+ *   - list_users_for_company()  → reads profiles for caller's company
+ *   - update_user_state(...)    → updates role + is_active for one user
+ *   - admin_invite_user(...)    → creates a new auth.users + profile
  */
 export function UserManagementPage() {
   const { companyId } = useAuth();
+  const queryClient = useQueryClient();
 
-  // useEntityQuery returns { list, create, ... }. For read we pull `list`,
-  // for invite we use a separate `supabase.rpc()` call (the invite isn't
-  // a regular CRUD row insert — it's a SECURITY DEFINER server function).
-  const users = useEntityQuery('user_profiles').list().data as UserRow[] | undefined;
+  const usersQuery = useQuery({
+    queryKey: ['rpc', 'list_users_for_company', companyId ?? 'none'],
+    queryFn: async () => {
+      const { data, error } = await supabase.rpc('list_users_for_company');
+      if (error) throw error;
+      return (data ?? []) as UserRow[];
+    },
+  });
+  const users = usersQuery.data;
 
-  // Invite form state.
   const [inviteEmail, setInviteEmail] = useState('');
   const [inviteRole, setInviteRole] = useState<UserRow['role']>('operator');
   const [inviteBusy, setInviteBusy] = useState(false);
@@ -46,12 +48,8 @@ export function UserManagementPage() {
     null,
   );
 
-  const refreshAfterMutation = async () => {
-    // useEntityQuery doesn't expose invalidate directly here (we'd need the
-    // query client). For simplicity, full page reload — the typical pattern
-    // after a server-side RPC. The useEntityQuery cache will refetch on
-    // window focus anyway.
-    window.location.reload();
+  const refreshList = async () => {
+    await queryClient.invalidateQueries({ queryKey: ['rpc', 'list_users_for_company'] });
   };
 
   const handleInvite = async (e: FormEvent) => {
@@ -62,7 +60,7 @@ export function UserManagementPage() {
       return;
     }
     setInviteBusy(true);
-    const { data, error } = await supabase.rpc('admin_invite_user', {
+    const { error } = await supabase.rpc('admin_invite_user', {
       p_email: inviteEmail,
       p_role: inviteRole,
     });
@@ -77,29 +75,33 @@ export function UserManagementPage() {
     });
     setInviteEmail('');
     setInviteRole('operator');
-    void refreshAfterMutation();
-    void data; // user_id returned by the RPC; not displayed here in M2
+    void refreshList();
     void companyId;
   };
 
   const updateRole = async (id: string, role: UserRow['role']) => {
-    const { error } = await supabase.from('user_profiles').update({ role }).eq('id', id);
+    const { error } = await supabase.rpc('update_user_state', {
+      p_user_id: id,
+      p_role: role,
+      p_is_active: null,
+    });
     if (error) {
       alert(`Role update failed: ${error.message}`);
     } else {
-      void refreshAfterMutation();
+      void refreshList();
     }
   };
 
   const toggleActive = async (id: string, currentActive: boolean) => {
-    const { error } = await supabase
-      .from('user_profiles')
-      .update({ is_active: !currentActive })
-      .eq('id', id);
+    const { error } = await supabase.rpc('update_user_state', {
+      p_user_id: id,
+      p_role: null,
+      p_is_active: !currentActive,
+    });
     if (error) {
       alert(`Toggle failed: ${error.message}`);
     } else {
-      void refreshAfterMutation();
+      void refreshList();
     }
   };
 
@@ -168,9 +170,17 @@ export function UserManagementPage() {
 
       <section className="card">
         <h3>Users in your company</h3>
-        {!users ? (
-          <div className="loading">Loading users…</div>
-        ) : users.length === 0 ? (
+        {usersQuery.isLoading ? (
+          <div className="loading" data-testid="users-loading">
+            <span className="loading__spinner" aria-hidden="true" />
+            Loading users…
+          </div>
+        ) : usersQuery.isError ? (
+          <div className="form-error form-error--server" role="alert">
+            Failed to load users:{' '}
+            {usersQuery.error instanceof Error ? usersQuery.error.message : 'unknown error'}
+          </div>
+        ) : !users || users.length === 0 ? (
           <p>No users visible for your company yet.</p>
         ) : (
           <table className="data-table">

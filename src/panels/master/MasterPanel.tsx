@@ -34,6 +34,9 @@ export function MasterPanel() {
         <NavLink to="/master/rates" style={subNavLinkStyle}>
           Rates
         </NavLink>
+        <NavLink to="/master/gst" style={subNavLinkStyle}>
+          GST
+        </NavLink>
       </nav>
 
       <div className="card card--accent" style={{ marginTop: '1.5rem' }}>
@@ -42,9 +45,10 @@ export function MasterPanel() {
           Pick a section above. <strong>Company Detail</strong> is live in
           M3 (TAXI-301). <strong>Utilities</strong> is live in M4
           (TAXI-401–405). <strong>Customers</strong> is live in M5
-          (TAXI-501–504). <strong>Rates</strong> shell ships in M6
-          (TAXI-601); the rate matrix CRUD lands in TAXI-602. GST
-          Management (M7) will mount its route here as it ships.
+          (TAXI-501–504). <strong>Rates</strong> is live in M6
+          (TAXI-601–603). <strong>GST</strong> page ships in M7
+          (TAXI-701); the time-travel + verification flow lands in
+          TAXI-702–705.
         </p>
       </div>
     </main>

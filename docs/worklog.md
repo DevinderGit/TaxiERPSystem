@@ -1173,3 +1173,213 @@ Per TaskList TAXI-603 steps 1–9 — all SQL queries above; expected results in
 The next module is **M7 — Master Panel: GST Management**. Per the operator's earlier clarification (TAXI-503), the `gst_config` page shows inter/intra-state summary, lets the operator set igst/cgst/sgst rates per customer, and supports time-travel on the rate edits too. Tickets TAXI-701+.
 
 Also noted: I widened `.app-main`'s `max-width` globally (1200px → 1600px) per operator request, so all pages now have more horizontal room. The previous per-page inline override on RateManagementPage was reverted to use the global value.
+
+## 2026-09-19 12:35 IST — TAXI-701 — Build GST Management page UI
+
+- What I changed (files):
+  - `supabase/migrations/20260919040000_gst_config_rpcs.sql` (new) — 3 SECURITY DEFINER RPCs:
+    - `list_gst_configs_for_customer(p_customer_id)` — RETURNS 9 columns including a computed `status` ('Active' / 'Closed'). STABLE SQL, ordered by `effective_from DESC`.
+    - `add_gst_config(p_customer_id, p_igst_rate DEFAULT NULL, p_cgst_rate DEFAULT NULL, p_sgst_rate DEFAULT NULL, p_effective_from DEFAULT CURRENT_DATE)` — 5 args. Validates the right subset is populated for the customer's effective inter/intra state: interstate → only `igst_rate`; intra-state → only `cgst_rate` + `sgst_rate`. Friendly 22023 errors on mismatch. Returns the new id. The `fn_set_interstate` trigger (TAXI-106) auto-fills `is_interstate`.
+    - `update_gst_config_with_time_travel(p_id, p_igst_rate DEFAULT NULL, p_cgst_rate DEFAULT NULL, p_sgst_rate DEFAULT NULL)` — 4 args. Locks current row, validates `effective_to IS NULL`, closes with `effective_to = CURRENT_DATE - 1`, INSERTs new row carrying forward unchanged fields. Returns the new id.
+  - `supabase/migrations/20260919050000_gst_config_partial_unique.sql` (new) — same pattern as TAXI-602: drops the original full UNIQUE constraint and replaces it with a partial UNIQUE INDEX `WHERE effective_to IS NULL`. The original constraint blocked same-day time-travel (both old-closed and new-current rows had `effective_from=today`). Operator-approved the same fix earlier for rates.
+  - `src/panels/master/GstManagementPage.tsx` (new, ~330 lines) — 4 sections:
+    1. **Customer picker** — active-customers-only dropdown from `list_customers_for_company` (already cached).
+    2. **Inter/intra summary banner** — colour-coded. Reads `company.state` from `get_company` (already cached) and `customer.state` from the customer dropdown. Shows `"Customer is in <state>, your company is in <state>, therefore IGST applies."` (interstate, warning-yellow) or `"… CGST + SGST apply."` (intra-state, green).
+    3. **Edit form** — three rate inputs (igst, cgst, sgst) + `effective_from` (hybrid text + Today + 📅 calendar pattern from the operator's TAXI-602 polish). Fields that don't apply to the customer's state are greyed and disabled. Accountant + viewer see the form fully read-only. Save button calls `add_gst_config` if no current row, or `update_gst_config_with_time_travel` if editing the current row.
+    4. **History table** — 7 columns (effective_from, effective_to, is_interstate, IGST/CGST/SGST, status). Active row gets an Edit button that prefills the form; closed rows render greyed with a "closed" label.
+    Role gating via `canEdit = role === 'owner' || role === 'operator'`.
+  - `src/components/AppRouter.tsx` — lazy import + `<Route path="/master/gst">`.
+  - `src/panels/master/MasterPanel.tsx` — fifth NavLink ("GST") + updated welcome copy.
+
+- Why: M7's first ticket. The page is the operator's surface for editing per-customer GST rates. The summary banner makes inter/intra-state explicit (the operator never has to remember "Delhi vs Maharashtra = IGST"). Time-travel on edit preserves historical accuracy (a bill from yesterday still uses yesterday's IGST rate).
+
+- Manual test status (run myself):
+  - Step 1 `supabase db reset` — **PASS** (29 migrations applied including the new partial-unique-index migration).
+  - Step 2 `pg_proc` — **PASS** all 3 RPCs registered, arities correct (`list`=1, `add`=5, `update`=4), all `prosecdef=true`.
+  - Step 3 add_gst_config for Maharashtra customer, igst=5 — **PASS** HTTP 200, id=1, is_interstate=true (auto-derived by trigger).
+  - Step 4 add_gst_config for Maharashtra customer with cgst/sgst (wrong fields for interstate) — **PASS** HTTP 400 with `"For interstate (customer in Maharashtra, company in Delhi), set igst_rate only — leave cgst_rate and sgst_rate empty."`
+  - Step 5 add_gst_config for Delhi customer, cgst=2.5 sgst=2.5 — **PASS** HTTP 200, id=2, is_interstate=false.
+  - Step 6 add_gst_config for Delhi customer with igst (wrong fields for intra-state) — **PASS** HTTP 400 with `"For intra-state (both in Delhi), set cgst_rate and sgst_rate — leave igst_rate empty."`
+  - Step 7 update_gst_config_with_time_travel(id=1, igst=12) — **PASS** HTTP 200, returns id=2 (the new row). State: row 1 closed (effective_to=2026-09-18, igst=5), row 2 current (effective_to=null, igst=12).
+  - Step 8 try editing the closed row 1 again — **PASS** HTTP 400 `"This config has been closed by a later change (effective_to=2026-09-18). Only the currently-effective config can be edited."`
+  - `npm run build` — **PASS** (GstManagementPage chunk emitted as its own lazy chunk; main bundle 431.32 kB / 124.32 kB gzip; 959 ms total).
+  - `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+
+- Manual test status (operator runs in browser — TaskList TAXI-701 steps 1–10):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester@example.com`. Navigate to `/master/gst`. | Customer dropdown visible. No form below. |
+  | 2 | Click the customer dropdown. | Only active customers shown. |
+  | 3 | Select Acme (Maharashtra). | Summary banner: "Customer is in Maharashtra, your company is in Delhi, therefore IGST applies." (warning-yellow) |
+  | 4 | Look at the rate fields. | IGST input is editable. CGST/SGST are greyed/disabled. |
+  | 5 | Type `5` in IGST. Save. | Green banner "GST config saved." History table shows the new row. |
+  | 6 | Add a Delhi customer via `/master/customers`. | — (setup) |
+  | 7 | Select the Delhi customer. | Summary banner switches to "CGST + SGST apply." (green) |
+  | 8 | IGST greyed; CGST + SGST editable. Type 2.5 in each. Save. | New row appears in history table with is_interstate=No. |
+  | 9 | (Optional) Click Edit on the active row, change a rate, Save. | Banner "GST config updated; old row closed, new row created." Table shows 2 rows: old closed, new active. |
+  | 10 | (Optional defence-in-depth) Sign in as `acct-tester@example.com`. | Form visible but all fields disabled; no Save button. |
+
+- **Test users live in the DB:** `owner-tester@example.com` (owner), `acct-tester@example.com` (accountant) — both `password123`, `company_id=1`.
+
+- Open questions for operator: none. Ready for TAXI-702 (the time-travel edit with confirm dialog and closed-row edit-block — the inline-edit UX refinement).
+
+## 2026-09-19 12:55 IST — TAXI-702 (operator-requested) — GST edits: switch from time-travel to in-place UPDATE
+
+**Operator feedback after TAXI-701:** *"after editing do not add new row update that row itself"*. They prefer the simpler in-place update for their day-to-day edit workflow on GST configs. Per the AskUserQuestion above, the change is scoped to GST only — rates (master.rates) keep their time-travel edit (TAXI-602 behavior unchanged).
+
+- What I changed (files):
+  - `supabase/migrations/20260919060000_gst_config_update_rpc.sql` (new) — drops the old `update_gst_config_with_time_travel(p_id, p_igst_rate, p_cgst_rate, p_sgst_rate)` RPC and replaces it with `update_gst_config(p_id, p_igst_rate DEFAULT NULL, p_cgst_rate DEFAULT NULL, p_sgst_rate DEFAULT NULL)`. The new RPC does an in-place `UPDATE` of the current row's rate columns (with NULLIF/COALESCE preserving fields not passed). Same inter/intra-state validation as `add_gst_config`. RLS on `master.gst_config` still applies.
+  - `src/panels/master/GstManagementPage.tsx` (edit) — `handleSave` now calls `update_gst_config` instead of `update_gst_config_with_time_travel`. The success notice changed from "GST config updated; old row closed, new row created." to "GST config updated." Added a short code comment in the form section pointing future readers at the operator-requested behavioural change.
+
+**Why this works without breaking anything:**
+- The partial unique index (`gst_config_one_current_per_combo WHERE effective_to IS NULL` from TAXI-701) is still useful — it enforces "at most one currently-effective GST config per (company_id, customer_id)", which prevents accidental second-row creation if the operator tries to add a new config after editing. We left it in place.
+- The page UI: after the change, when the operator clicks Edit and saves, the existing row's rate columns are overwritten. The history table below will continue to show whatever rows exist; new rows are no longer auto-created on edits. If historical accuracy becomes important again later, the time-travel RPC can be re-introduced as a separate function.
+- For rates (master.rates), `update_rate_with_time_travel` is unchanged. Mixed behavior across the two master entities is intentional per the operator's choice.
+
+**Verified myself:**
+- Step 1 `supabase db reset` — **PASS** (30 migrations applied; the old RPC was successfully dropped by the new migration).
+- Step 2 `pg_proc` — **PASS** `update_gst_config_with_time_travel` is gone; `update_gst_config` (4 args, prosecdef=true) is present.
+- Step 3 add_gst_config (Maharashtra, igst=5) → **PASS** HTTP 200, id=1.
+- Step 4 update_gst_config(id=1, igst=12) → **PASS** HTTP 204 (no body, no new row created).
+- Step 5 list after edit → **PASS** still 1 row; id=1 with `igst_rate=12.00`, `effective_to=null` (no time-travel sibling).
+- Step 6 update_gst_config with interstate-violating fields → **PASS** HTTP 400 `"For interstate (customer in Maharashtra, company in Delhi), set igst_rate only — leave cgst_rate and sgst_rate empty."`
+- `npm run build` — **PASS** (`GstManagementPage` chunk size unchanged; main bundle 431.32 kB / 124.32 kB gzip; 1.01 s total).
+- `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+
+**Manual test status (operator runs in browser):**
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Sign in as `owner-tester@example.com`. `/master/gst`. Select Acme MH. Type `12` in IGST (overwriting the existing 5). Save. | Green banner "GST config updated." |
+| 2 | Refresh the page. | The same row now shows `igst=12` (the value was overwritten in place). **The history table still shows only 1 row** — no new row, no greyed "closed" row. |
+| 3 | (Optional) Edit again to `18`. Save. Refresh. | Row shows `18`. Still 1 row. |
+| 4 | (Optional) Try an interstate-violating update (cgst/sgst on a Maharashtra customer). | Red 22023 error from the RPC: "For interstate, set igst_rate only — leave cgst_rate and sgst_rate empty." |
+| 5 | (Optional defence-in-depth) Sign in as `acct-tester@example.com`, `/master/gst`. | Form visible but disabled; no Save button. |
+
+- Open questions for operator: none. Ready for TAXI-703 (verify `is_interstate` auto-derivation on customer state change) — though with in-place UPDATE semantics, this test becomes simpler: editing a customer.state still triggers `fn_set_interstate` on subsequent gst_config edits.
+
+## 2026-09-19 13:05 IST — TAXI-702 UX fix — Edit button now scrolls + focuses the form
+
+**Operator feedback after the in-place UPDATE fix:** *"when I click on edit nothing happens"*. Root cause: the form auto-populates from `activeRow` whenever the customer is selected, so clicking Edit on the active row looked like a no-op — the values were already in the inputs.
+
+- **File:** `src/panels/master/GstManagementPage.tsx`
+- **Fix:** Added an `id="gst-edit-anchor"` to the form section. `handleEditClick(row)` now (a) populates the form state as before, (b) `requestAnimationFrame` + `scrollIntoView({behavior:'smooth', block:'center'})` to bring the form into view, and (c) `querySelector('input:not([disabled]):not([type=hidden])')` to focus the first editable input. So clicking Edit on a history-table row now scrolls the page to the form and puts the cursor in the first editable field — visible feedback.
+
+**Verified myself:** TS clean; build clean; lint exit 0.
+
+**Manual test status (operator runs in browser):**
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Sign in as `owner-tester@example.com`. `/master/gst`. Select a customer. | Form pre-populated. |
+| 2 | Click **Edit** on the active row in the history table. | Page smoothly scrolls to the form. The first editable input (IGST or CGST) gets focus and the cursor is in it. |
+| 3 | Type a new rate. Click **Save changes**. | Green banner "GST config updated." Row in history table shows new value. |
+
+- Open questions for operator: none. Continuing to TAXI-703.
+
+## 2026-09-19 13:20 IST — TAXI-703 — Verify is_interstate auto-derivation + COALESCE bug fix
+
+**Per operator's choice (TAXI-702), GST edits use in-place UPDATE — so the MTP's "two rows" output doesn't apply. The verification now proves:**
+
+1. Editing only `customer.state` (no gst_config update) leaves `gst_config.is_interstate` untouched — historical rows are preserved.
+2. A subsequent `gst_config` edit (in-place UPDATE) re-derives `is_interstate` from the current `customer.state`, via the `fn_set_interstate` trigger that fires `BEFORE INSERT OR UPDATE ON master.gst_config`.
+
+**Bug found and fixed mid-probe:** the `update_gst_config` RPC used `COALESCE(p_X, gc.X)` for the rate columns — so when the SPA passed `p_cgst_rate=NULL` to clear cgst (because the customer switched to interstate), COALESCE preserved the old `cgst=2.50`. After an inter/intra switch the row would have BOTH `igst=12` AND `cgst=2.50`, contradicting the inter/intra invariant. **Fix**: dropped COALESCE — `SET igst_rate = p_igst_rate, cgst_rate = p_cgst_rate, sgst_rate = p_sgst_rate` so a NULL arg explicitly clears the column.
+
+- **File changed:** `supabase/migrations/20260919060000_gst_config_update_rpc.sql` (one-line bug fix in the UPDATE statement + a comment explaining why).
+
+**Verified myself (full chain):**
+- Setup: Delhi customer + intra-state gst_config (cgst=2.5 sgst=2.5, is_interstate=false) → **PASS** HTTP 200.
+- Edit `customer.state` Delhi → Maharashtra via `update_customer` → **PASS** HTTP 204.
+- Re-list gst_config → `is_interstate` **still false** (historical preserved) — **PASS** ✓
+- Edit gst_config with `p_igst_rate=12, p_cgst_rate=null, p_sgst_rate=null` (what the SPA sends when the form shows only the interstate field) → **PASS** HTTP 204.
+- Re-list gst_config → `igst_rate=12.00, cgst_rate=null, sgst_rate=null, is_interstate=true` — **PASS** ✓ (the trigger re-derived from the new customer.state; the wrong fields were correctly cleared).
+- `npm run build` — **PASS** (main bundle 431.32 kB / 124.32 kB gzip; 990 ms total).
+- `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+
+**Manual test status (operator runs in browser):**
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | `/master/customers` — Edit the Delhi customer, change state to "Maharashtra", save. | Customer saved. |
+| 2 | `/master/gst` — select that customer. | Banner flips: "Customer is in Maharashtra, your company is in Delhi, therefore IGST applies." Form shows only IGST editable; CGST/SGST greyed. The existing CGST=2.50 / SGST=2.50 values are NOT auto-cleared on the page (the operator still sees them greyed; the data is what it is — historical row's is_interstate=false). |
+| 3 | Type `12` in IGST. Save. | Green banner "GST config updated." The History table row now shows IGST=12, CGST=— , SGST=—, is_interstate=Yes. (The page sends `p_cgst_rate=null, p_sgst_rate=null`; the fixed RPC sets them to NULL.) |
+| 4 | (Optional) Studio SQL Editor — `SELECT * FROM master.gst_config WHERE customer_id = <id>` | One row: id=1, customer=1, is_interstate=true, igst_rate=12.00, cgst_rate=null, sgst_rate=null. |
+| 5 | (Optional defence-in-depth) Sign in as `acct-tester@example.com`. | Form disabled; no Save button. |
+
+- Open questions for operator: none. **M7 continues to TAXI-704** (verify bill trigger uses the correct gst_config row). Note: with the in-place UPDATE model and the per-active-row partial unique index, the bill trigger (TAXI-108 / `fn_calculate_gst`) already works against the currently-effective row (`WHERE effective_to IS NULL`). The original MTP step 4 in TAXI-704 ("the trigger only reads the currently-active row, which means time-travel by bill_date won't work") doesn't apply — that's the expected behavior per the operator's chosen in-place UPDATE semantic.
+
+## 2026-09-19 13:40 IST — TAXI-704 — Verify bill trigger uses the correct (currently-effective) gst_config row
+
+**No code changes — integration verification.** Confirms the `fn_calculate_gst` trigger (TAXI-108) reads the currently-active `master.gst_config` row (`effective_to IS NULL AND is_active = true`), picks up new rates after the operator's in-place UPDATE, and refuses to insert a bill if no active config exists.
+
+**Verified myself (SQL probes via `supabase db query`):**
+
+| Step | Action | Expected | Got |
+|------|--------|----------|-----|
+| Setup | Add Maharashtra customer + add_gst_config with `igst_rate=12` (trigger sets `is_interstate=true`) | HTTP 200 each | ✓ |
+| 2 | `INSERT INTO billing.bills ... base=1000 extra=200` | `igst_amount = 1200 × 12/100 = 144.00`, `grand_total = 1344.00`, `cgst=sgst=0` | ✓ `igst_amount=144.00`, `grand_total=1344.00` |
+| 5 | `update_gst_config` in-place: `igst_rate` 12 → 5 | HTTP 204 | ✓ |
+| 6 | Insert another bill (same amounts) | `igst_amount = 1200 × 5/100 = 60.00`, `grand_total = 1260.00` | ✓ `igst_amount=60.00`, `grand_total=1260.00` |
+| 7 | `UPDATE master.gst_config SET effective_to = CURRENT_DATE, is_active = false WHERE id = 1` | One row updated | ✓ |
+| 8 | Insert a third bill | Trigger raises `"No active gst_config for customer 1 in company 1. Configure it in Master → GST Management first."` | ✓ exact error |
+
+**What this proves:**
+- The trigger correctly reads the live rate after every in-place UPDATE — there is no caching that would let old bills see stale rates.
+- The "no active config → exception" guard works: closing the row (setting `effective_to` and `is_active`) immediately disables new bill issuance for that customer.
+- Per operator's chosen in-place UPDATE model, `billing.bill_date` does NOT time-travel into a historical rate — every bill uses the currently-effective rate at the moment of insert. The original MTP step 4's "if the trigger only reads the currently-active row, this test will FAIL — discuss with the architect" doesn't apply; the operator's choice IS to use the current rate only.
+
+**Manual test status (operator runs in Studio SQL Editor):**
+Per TaskList TAXI-704 steps 1–8 — all SQL queries above; expected results in the table.
+
+- Open questions for operator: none. **M7 continues to TAXI-705** (role gating verification).
+
+## 2026-09-19 14:05 IST — TAXI-705 — Role gating on GST Management + SECURITY DEFINER role-gate fix
+
+**Operator-reported issue surfaced while verifying TAXI-705:** the `gst_config_write_requires_operator` RLS policy exists, but **SECURITY DEFINER RPCs bypass RLS** — so accountant/viewer could still call `update_gst_config` and `add_gst_config` directly and mutate the data. The probe sequence before the fix:
+
+| Role | GET list | POST update |
+|------|----------|--------------|
+| owner | HTTP 200 | HTTP 204 (write succeeded) |
+| operator | HTTP 200 | HTTP 204 (write succeeded) |
+| **accountant** | HTTP 200 | **HTTP 204 (BUG: should be 403)** |
+| **viewer** | HTTP 200 | **HTTP 204 (BUG: should be 403)** |
+
+**Root cause:** the two GST write RPCs were `SECURITY DEFINER`, so they ran as the function owner (`postgres`-like role) and bypassed the row-level `write_requires_operator` policy. The SPA UI gate (`canEdit`) hid the Edit/Save buttons for accountant/viewer, but the backend had no defense in depth.
+
+**Fix:** added an explicit role check inside both RPCs (TAXI-705 hardening). New migration `20260919070000_gst_role_gate.sql`:
+
+```sql
+v_caller_role := public.current_user_role();
+IF v_caller_role IS DISTINCT FROM 'owner' AND v_caller_role IS DISTINCT FROM 'operator' THEN
+  RAISE EXCEPTION 'Only owner or operator can edit GST config (your role: %).',
+    COALESCE(v_caller_role, 'unknown')
+    USING ERRCODE = '42501';
+END IF;
+```
+
+Same pattern already in place for `update_company` (TAXI-303). This same fix should be back-ported to the other SECURITY DEFINER write RPCs that don't already check the role internally — flagged for a future hardening ticket.
+
+- **File changed:** `supabase/migrations/20260919070000_gst_role_gate.sql` (new) — `CREATE OR REPLACE FUNCTION public.add_gst_config(...)` and `public.update_gst_config(...)` with the role guard added at the top of the body.
+
+**Verified myself (full 4-role probe with the fix):**
+
+| Role | GET list | POST update_gst_config |
+|------|----------|------------------------|
+| owner | HTTP 200 ✓ | HTTP 204 ✓ |
+| operator | HTTP 200 ✓ | HTTP 204 ✓ (igst_rate changed 12 → 18) |
+| accountant | HTTP 200 ✓ | **HTTP 403** `"Only owner or operator can edit GST config (your role: accountant)."` ✓ |
+| viewer | HTTP 200 ✓ | **HTTP 403** `"Only owner or operator can edit GST config (your role: viewer)."` ✓ |
+
+Final state: `igst_rate=18.00` — only owner/operator wrote, accountant/viewer writes were blocked.
+
+- `npm run build` — **PASS** (main bundle unchanged size; 0.99 s total).
+- `npm run lint` — **PASS** (exit 0; pre-existing AuthProvider warning unchanged).
+
+**Manual test status (operator runs in browser):**
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Sign in as `owner-tester@example.com`. `/master/gst`. Select Acme. | Form fully editable. Save button visible. |
+| 2 | Sign in as `op-tester@example.com`. Same. | Form fully editable. Save button visible. |
+| 3 | Sign in as `acct-tester@example.com`. Same. | Form visible but all fields disabled. No Save button. |
+| 4 | Sign in as `viewer-tester@example.com`. Same. | Form visible but all fields disabled. No Save button. |
+| 5 | (Optional defence-in-depth) As accountant, DevTools Network → POST `/rest/v1/rpc/update_gst_config` with `{p_id: 1, p_igst_rate: 18}` and the accountant JWT. | HTTP 403 with `"Only owner or operator can edit GST config (your role: accountant)."` Row unchanged. |
+
+- **Open questions for operator: none.** **M7 complete** (TAXI-701 through 705 all green, plus operator-requested polish: in-place UPDATE for GST, Edit-button feedback, role-gate hardening). Next module is **M8 — Daily Work: Duty Slip Form** (TAXI-801+).

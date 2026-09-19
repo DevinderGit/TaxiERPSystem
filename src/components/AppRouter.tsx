@@ -41,6 +41,16 @@ const UtilitiesPage = lazy(() =>
     default: m.UtilitiesPage,
   })),
 );
+const CustomersPage = lazy(() =>
+  import('../panels/master/CustomersPage').then((m) => ({
+    default: m.CustomersPage,
+  })),
+);
+const RateManagementPage = lazy(() =>
+  import('../panels/master/RateManagementPage').then((m) => ({
+    default: m.RateManagementPage,
+  })),
+);
 const DailyWorkPanel = lazy(() =>
   import('../panels/dailywork/DailyWorkPanel').then((m) => ({ default: m.DailyWorkPanel })),
 );
@@ -68,6 +78,8 @@ export function AppRouter() {
           <Route path="/master" element={<MasterPanel />} />
           <Route path="/master/company" element={<CompanyDetailPage />} />
           <Route path="/master/utilities" element={<UtilitiesPage />} />
+          <Route path="/master/customers" element={<CustomersPage />} />
+          <Route path="/master/rates" element={<RateManagementPage />} />
           <Route path="/daily-work/*" element={<DailyWorkPanel />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
           <Route path="/reports/*" element={<ReportsPanel />} />

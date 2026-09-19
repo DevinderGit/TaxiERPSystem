@@ -28,16 +28,23 @@ export function MasterPanel() {
         <NavLink to="/master/utilities" style={subNavLinkStyle}>
           Utilities
         </NavLink>
+        <NavLink to="/master/customers" style={subNavLinkStyle}>
+          Customers
+        </NavLink>
+        <NavLink to="/master/rates" style={subNavLinkStyle}>
+          Rates
+        </NavLink>
       </nav>
 
       <div className="card card--accent" style={{ marginTop: '1.5rem' }}>
         <h3>Welcome</h3>
         <p>
           Pick a section above. <strong>Company Detail</strong> is live in
-          M3 (TAXI-301). <strong>Utilities</strong> shell ships in M4
-          (TAXI-401); the Vehicles and Doc No. Control tabs fill in over
-          TAXI-402..405. Customers (M5), Rates (M6), and GST Management
-          (M7) will mount their routes here as they ship.
+          M3 (TAXI-301). <strong>Utilities</strong> is live in M4
+          (TAXI-401–405). <strong>Customers</strong> is live in M5
+          (TAXI-501–504). <strong>Rates</strong> shell ships in M6
+          (TAXI-601); the rate matrix CRUD lands in TAXI-602. GST
+          Management (M7) will mount its route here as it ships.
         </p>
       </div>
     </main>

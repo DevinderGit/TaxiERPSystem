@@ -171,13 +171,11 @@ export function RateManagementPage() {
       cancelCellEdit();
       return;
     }
-    if (!window.confirm('Changing a rate creates a new effective row. The old rate will be closed. Continue?')) {
-      cancelCellEdit();
-      return;
-    }
+    // Per operator directive (M6 follow-up): no more time-travel. The new
+    // `update_rate` RPC does an in-place UPDATE — no confirm dialog needed.
     const payload: Record<string, number | null> = {};
     payload[`p_${field}`] = newValue;
-    const { error: rpcErr } = await supabase.rpc('update_rate_with_time_travel', {
+    const { error: rpcErr } = await supabase.rpc('update_rate', {
       p_id: row.id,
       ...payload,
     });
@@ -185,7 +183,7 @@ export function RateManagementPage() {
       setCellError(rpcErr.message);
       return;
     }
-    setActionNotice('Rate updated; old row closed, new row created.');
+    setActionNotice('Rate updated.');
     setTimeout(() => setActionNotice(null), 2000);
     cancelCellEdit();
     await queryClient.invalidateQueries({ queryKey: ['rpc', 'list_rates_for_customer'] });

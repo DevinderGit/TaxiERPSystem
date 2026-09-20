@@ -30,15 +30,6 @@ interface RateFormModalProps {
   onSaved: () => void;
 }
 
-const DUTY_TYPES = [
-  { value: 'per_km', label: 'per_km' },
-  { value: 'per_hour', label: 'per_hour' },
-  { value: 'per_day', label: 'per_day' },
-  { value: 'local_package', label: 'local_package' },
-  { value: 'outstation', label: 'outstation' },
-  { value: 'flexible', label: 'flexible (no rate card)' },
-] as const;
-
 function todayISO() {
   const d = new Date();
   const yyyy = d.getFullYear();
@@ -58,10 +49,14 @@ export function RateFormModal({
 }: RateFormModalProps) {
   const queryClient = useQueryClient();
   const dateInputRef = useRef<HTMLInputElement>(null);
-  const [dutyType, setDutyType] = useState<string>('per_km');
   const [effectiveFrom, setEffectiveFrom] = useState<string>(todayISO());
   const [error, setError] = useState<string | null>(null);
-  const isFlexible = dutyType === 'flexible';
+  // Per operator directive (M6 + M8 follow-up): duty_type is no longer
+  // selected on the Add/Edit Rate form. Rates are per (customer, vehicle)
+  // only; duty_type is picked on the duty slip form. We still send
+  // p_duty_type: 'local' on the wire so the legacy RPC signature stays
+  // compatible (add_rate accepts it as NULL too).
+  const [dutyType] = useState<string>('local');
 
   // Open the native date picker on browsers that support showPicker() (Chrome/Edge/Firefox 101+);
   // fall back to focus+click for older Safari.
@@ -75,10 +70,10 @@ export function RateFormModal({
     el.click();
   };
 
-  const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
+  const handleSubmit = async (_e: FormEvent<HTMLFormElement>) => {
+    _e.preventDefault();
     setError(null);
-    const fd = new FormData(e.currentTarget);
+    const fd = new FormData(_e.currentTarget);
 
     const numOrNull = (k: string) => {
       const raw = String(fd.get(k) ?? '').trim();
@@ -90,7 +85,7 @@ export function RateFormModal({
     // For flexible duty type, base_rate is still NOT NULL in the schema.
     // We pass 0 — the duty slip form (M8) will override this anyway.
     // This matches TAXI-605's spec note.
-    const base_rate = isFlexible ? 0 : numOrNull('base_rate');
+    const base_rate = numOrNull('base_rate');
 
     const payload = {
       p_customer_id:      customerId,
@@ -126,11 +121,11 @@ export function RateFormModal({
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
       }}
-      onClick={(e) => { if (e.target === e.currentTarget && !busy) onClose(); }}
+      onClick={() => { /* backdrop-click no longer closes; use Cancel/Save */ }}
     >
       <div
         className="card"
-        style={{ maxWidth: '640px', width: '90%', maxHeight: '90vh', overflowY: 'auto', padding: '1.5rem', position: 'relative' }}
+        style={{ maxWidth: '1080px', width: '90%', maxHeight: '92vh', overflowY: 'auto', padding: '1.5rem', position: 'relative' }}
       >
         <button
           type="button"
@@ -160,14 +155,6 @@ export function RateFormModal({
               <select id="rate-type" name="vehicle_type_id" required>
                 <option value="">-- select type --</option>
                 {types.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
-              </select>
-            </div>
-            <div className="form-field" style={{ flex: 1 }}>
-              <label htmlFor="rate-duty">Duty type</label>
-              <select id="rate-duty" name="duty_type" value={dutyType} onChange={(e) => setDutyType(e.target.value)}>
-                {DUTY_TYPES.map((d) => (
-                  <option key={d.value} value={d.value}>{d.label}</option>
-                ))}
               </select>
             </div>
           </div>
@@ -232,58 +219,50 @@ export function RateFormModal({
             )}
           </div>
 
-          {!isFlexible && (
-            <fieldset style={{ border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', padding: '0.75rem' }}>
-              <legend style={{ padding: '0 0.4rem', color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>Rate fields</legend>
+          <fieldset style={{ border: '1px solid var(--color-border)', borderRadius: 'var(--radius-sm)', padding: '0.75rem' }}>
+            <legend style={{ padding: '0 0.4rem', color: 'var(--color-text-muted)', fontSize: '0.8rem' }}>Rate fields</legend>
 
-              <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-                <div className="form-field" style={{ width: '140px' }}>
-                  <label htmlFor="rate-base">Base rate *</label>
-                  <input id="rate-base" name="base_rate" type="number" step="0.01" min="0" required />
-                </div>
-                <div className="form-field" style={{ width: '110px' }}>
-                  <label htmlFor="rate-perkm">/km</label>
-                  <input id="rate-perkm" name="per_km_rate" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '110px' }}>
-                  <label htmlFor="rate-perhr">/hr</label>
-                  <input id="rate-perhr" name="per_hour_rate" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '110px' }}>
-                  <label htmlFor="rate-perday">/day</label>
-                  <input id="rate-perday" name="per_day_rate" type="number" step="0.01" min="0" />
-                </div>
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <div className="form-field" style={{ width: '140px' }}>
+                <label htmlFor="rate-base">Base rate *</label>
+                <input id="rate-base" name="base_rate" type="number" step="0.01" min="0" required />
               </div>
-              <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
-                <div className="form-field" style={{ width: '130px' }}>
-                  <label htmlFor="rate-exh">Extra /hr</label>
-                  <input id="rate-exh" name="extra_hour_rate" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '130px' }}>
-                  <label htmlFor="rate-exkm">Extra /km</label>
-                  <input id="rate-exkm" name="extra_km_rate" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '130px' }}>
-                  <label htmlFor="rate-night">Night halt</label>
-                  <input id="rate-night" name="night_halt_rate" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '130px' }}>
-                  <label htmlFor="rate-driver">Driver allowance</label>
-                  <input id="rate-driver" name="driver_allowance" type="number" step="0.01" min="0" />
-                </div>
-                <div className="form-field" style={{ width: '130px' }}>
-                  <label htmlFor="rate-min">Min charge</label>
-                  <input id="rate-min" name="min_charge" type="number" step="0.01" min="0" />
-                </div>
+              <div className="form-field" style={{ width: '110px' }}>
+                <label htmlFor="rate-perkm">/km</label>
+                <input id="rate-perkm" name="per_km_rate" type="number" step="0.01" min="0" />
               </div>
-            </fieldset>
-          )}
-
-          {isFlexible && (
-            <div className="form-message" style={{ background: 'var(--color-surface-2)', border: '1px solid var(--color-border)', color: 'var(--color-text-muted)' }} role="note">
-              Flexible duty type has no rate card. The operator enters a custom amount on each duty slip.
+              <div className="form-field" style={{ width: '110px' }}>
+                <label htmlFor="rate-perhr">/hr</label>
+                <input id="rate-perhr" name="per_hour_rate" type="number" step="0.01" min="0" />
+              </div>
+              <div className="form-field" style={{ width: '110px' }}>
+                <label htmlFor="rate-perday">/day</label>
+                <input id="rate-perday" name="per_day_rate" type="number" step="0.01" min="0" />
+              </div>
             </div>
-          )}
+            <div style={{ display: 'flex', gap: '0.75rem', flexWrap: 'wrap' }}>
+              <div className="form-field" style={{ width: '130px' }}>
+                <label htmlFor="rate-exh">Extra /hr</label>
+                <input id="rate-exh" name="extra_hour_rate" type="number" step="0.01" min="0" />
+              </div>
+              <div className="form-field" style={{ width: '130px' }}>
+                <label htmlFor="rate-exkm">Extra /km</label>
+                <input id="rate-exkm" name="extra_km_rate" type="number" step="0.01" min="0" />
+              </div>
+              <div className="form-field" style={{ width: '130px' }}>
+                <label htmlFor="rate-night">Night halt</label>
+                <input id="rate-night" name="night_halt_rate" type="number" step="0.01" min="0" />
+              </div>
+              <div className="form-field" style={{ width: '130px' }}>
+                <label htmlFor="rate-driver">Driver allowance</label>
+                <input id="rate-driver" name="driver_allowance" type="number" step="0.01" min="0" />
+              </div>
+              <div className="form-field" style={{ width: '130px' }}>
+                <label htmlFor="rate-min">Min charge</label>
+                <input id="rate-min" name="min_charge" type="number" step="0.01" min="0" />
+              </div>
+            </div>
+          </fieldset>
 
           {error && <div className="form-error form-error--server" role="alert">{error}</div>}
 

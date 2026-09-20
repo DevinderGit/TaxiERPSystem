@@ -1,3 +1,10 @@
+import { NavLink } from 'react-router-dom';
+
+/**
+ * DailyWorkPanel — landing page for the /daily-work/* routes.
+ *
+ * Sub-routes are added as they ship. For now: Duty Slips list (M8).
+ */
 export function DailyWorkPanel() {
   return (
     <main className="app-main">
@@ -7,9 +14,28 @@ export function DailyWorkPanel() {
       <p className="page-subtitle">
         Where the operator spends most of the day.
       </p>
+
+      <nav className="sub-nav" aria-label="Daily work sections" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
+        <NavLink
+          to="/daily-work/duty-slips"
+          style={{
+            padding: '0.45rem 0.85rem',
+            borderRadius: 'var(--radius-sm)',
+            border: '1px solid var(--color-border)',
+            background: 'var(--color-surface-2)',
+            color: 'var(--color-text-muted)',
+            fontWeight: 500,
+            fontSize: '0.9rem',
+            textDecoration: 'none',
+          }}
+        >
+          Duty Slips
+        </NavLink>
+      </nav>
+
       <div className="card card--accent">
         <p>
-          Duty slips (M8), Billing (M9), Change / Cancel Bill (M10), and Print
+          Billing (M9), Change / Cancel Bill (M10), and Print
           Bill / Duty Slip as PDF (M11) will mount under{' '}
           <code>/daily-work/*</code>.
         </p>

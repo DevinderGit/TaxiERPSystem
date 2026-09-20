@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Print — Placeholder</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #0c0c0e; color: #f5f5f7; font: 15px/1.5 system-ui, sans-serif;
+    }
+    .placeholder {
+      max-width: 540px; padding: 2rem 2.5rem; text-align: center;
+      background: #16161a; border: 1px solid #2a2a30; border-radius: 12px;
+    }
+    h1 { margin: 0 0 0.4rem; font-size: 1.4rem; color: #facc15; }
+    p  { margin: 0.6rem 0; color: #9ca3af; }
+    code { background: #1f1f24; padding: 0.1rem 0.45rem; border-radius: 4px; color: #facc15; }
+  </style>
+</head>
+<body>
+  <div class="placeholder">
+    <h1>PDF rendering coming in M11</h1>
+    <p>Duty Slip <code id="ds-no">DS-0001</code></p>
+    <p>The full PDF template (TAXI-1101) will replace this placeholder.</p>
+  </div>
+  <script>
+    // Read ?duty_slip_no=<no> from the query string and put it in the heading.
+    var m = new URLSearchParams(location.search).get('duty_slip_no');
+    if (m) document.getElementById('ds-no').textContent = m;
+  </script>
+</body>
+</html>

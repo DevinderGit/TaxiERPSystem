@@ -365,11 +365,11 @@ function VehicleFormModal({ initial, busy, error, groups, types, onSubmit, onCan
         position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)',
         display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
       }}
-      onClick={(e) => { if (e.target === e.currentTarget) onCancel(); }}
+      onClick={() => { /* backdrop-click no longer closes; use Cancel/Save */ }}
     >
       <div
         className="card"
-        style={{ maxWidth: '720px', width: '90%', maxHeight: '90vh', overflowY: 'auto', padding: '1.5rem', position: 'relative' }}
+        style={{ maxWidth: '1080px', width: '90%', maxHeight: '92vh', overflowY: 'auto', padding: '1.5rem', position: 'relative' }}
       >
         <button
           type="button"

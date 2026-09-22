@@ -1,10 +1,16 @@
-import { Link } from 'react-router-dom';
+import { Link, Navigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
 
 /**
- * Landing page. Hero title + a card grid that doubles as the
- * secondary navigation — clicking a card jumps into the panel.
- * Each panel's M-number is shown as a small badge so the operator
- * always knows what's coming next.
+ * Landing page.
+ *
+ * Behaviour:
+ *   - Signed in → show the 4-card grid linking into the panels.
+ *   - Not signed in → redirect to /login (carrying a `from` state so we
+ *     can bounce back here once authenticated).
+ *
+ * This makes the login form the de-facto "first page" the operator sees
+ * when opening the app cold.
  */
 const PANELS = [
   {
@@ -24,7 +30,8 @@ const PANELS = [
   {
     to: '/accounts',
     title: 'Accounts',
-    blurb: 'Ledger book and manual receipt / payment entries. Every financial event is auto-posted.',
+    blurb:
+      'Ledger book and manual receipt / payment entries. Every financial event is auto-posted.',
     module: 'M12',
   },
   {
@@ -37,6 +44,16 @@ const PANELS = [
 ];
 
 export function HomePage() {
+  const { user, isReady } = useAuth();
+  const location = useLocation();
+
+  // Hold routing decisions until AuthProvider has read the session; otherwise
+  // a hard refresh on a deep link while signed out would flash the home grid
+  // for a frame before the redirect fires.
+  if (isReady && !user) {
+    return <Navigate to="/login" state={{ from: location }} replace />;
+  }
+
   return (
     <main className="app-main">
       <h1 className="page-title">

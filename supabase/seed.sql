@@ -1,5 +1,9 @@
 -- M8 verification seed: 4 test users + minimal master data.
 
+-- pgcrypto is required for crypt() / gen_salt() in the user-creation block.
+-- The Supabase image installs it in the `extensions` schema, not `public`.
+SET search_path TO public, extensions;
+
 -- 1) Taxis (Sedan/AC) for the duty-slip / vehicle list
 INSERT INTO master.vehicle_groups (company_id, name, display_order)
   VALUES (1, 'Sedan', 1), (1, 'SUV', 2)

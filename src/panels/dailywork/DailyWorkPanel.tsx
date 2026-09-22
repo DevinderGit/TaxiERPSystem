@@ -3,9 +3,19 @@ import { NavLink } from 'react-router-dom';
 /**
  * DailyWorkPanel — landing page for the /daily-work/* routes.
  *
- * Sub-routes are added as they ship. For now: Duty Slips list (M8).
+ * Sub-routes are added as they ship: Duty Slips (M8), Billing (M9).
  */
 export function DailyWorkPanel() {
+  const linkStyle = {
+    padding: '0.45rem 0.85rem',
+    borderRadius: 'var(--radius-sm)',
+    border: '1px solid var(--color-border)',
+    background: 'var(--color-surface-2)',
+    color: 'var(--color-text-muted)',
+    fontWeight: 500,
+    fontSize: '0.9rem',
+    textDecoration: 'none',
+  };
   return (
     <main className="app-main">
       <h1 className="page-title">
@@ -16,27 +26,14 @@ export function DailyWorkPanel() {
       </p>
 
       <nav className="sub-nav" aria-label="Daily work sections" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '1rem' }}>
-        <NavLink
-          to="/daily-work/duty-slips"
-          style={{
-            padding: '0.45rem 0.85rem',
-            borderRadius: 'var(--radius-sm)',
-            border: '1px solid var(--color-border)',
-            background: 'var(--color-surface-2)',
-            color: 'var(--color-text-muted)',
-            fontWeight: 500,
-            fontSize: '0.9rem',
-            textDecoration: 'none',
-          }}
-        >
-          Duty Slips
-        </NavLink>
+        <NavLink to="/daily-work/duty-slips" style={linkStyle}>Duty Slips</NavLink>
+        <NavLink to="/daily-work/billing" style={linkStyle}>Billing</NavLink>
+        <NavLink to="/daily-work/change-cancel-bill" style={linkStyle}>Change / Cancel Bill</NavLink>
       </nav>
 
       <div className="card card--accent">
         <p>
-          Billing (M9), Change / Cancel Bill (M10), and Print
-          Bill / Duty Slip as PDF (M11) will mount under{' '}
+          Print Bill / Duty Slip as PDF (M11) will mount under{' '}
           <code>/daily-work/*</code>.
         </p>
       </div>

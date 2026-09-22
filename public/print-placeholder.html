@@ -21,13 +21,22 @@
 <body>
   <div class="placeholder">
     <h1>PDF rendering coming in M11</h1>
-    <p>Duty Slip <code id="ds-no">DS-0001</code></p>
+    <p id="kind-line"><span id="kind-label">Duty Slip</span> <code id="doc-no">DS-0001</code></p>
     <p>The full PDF template (TAXI-1101) will replace this placeholder.</p>
   </div>
   <script>
-    // Read ?duty_slip_no=<no> from the query string and put it in the heading.
-    var m = new URLSearchParams(location.search).get('duty_slip_no');
-    if (m) document.getElementById('ds-no').textContent = m;
+    // Reads ?duty_slip_no=<no> or ?bill_no=<no> from the query string and
+    // updates the heading. The label switches to "Bill" when bill_no is
+    // passed; defaults to "Duty Slip".
+    var p = new URLSearchParams(location.search);
+    var ds = p.get('duty_slip_no');
+    var bn = p.get('bill_no');
+    if (bn) {
+      document.getElementById('kind-label').textContent = 'Bill';
+      document.getElementById('doc-no').textContent = bn;
+    } else if (ds) {
+      document.getElementById('doc-no').textContent = ds;
+    }
   </script>
 </body>
 </html>

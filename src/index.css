@@ -421,6 +421,10 @@ a:hover {
   background: rgba(250, 204, 21, 0.04);
 }
 
+.data-table__row--selected {
+  background: rgba(250, 204, 21, 0.10);
+}
+
 .data-table__row--inactive {
   opacity: 0.5;
 }

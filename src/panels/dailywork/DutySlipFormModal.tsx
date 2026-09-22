@@ -67,6 +67,17 @@ export interface DutySlipInitial {
   driver_name: string | null;
   driver_phone: string | null;
   custom_rate_items: FlexibleItem[];
+  // M10 — when the slip is already on a bill, the form shows a
+  // warning that saving will leave the bill's snapshotted totals
+  // stale. Operator must cancel the bill (Change / Cancel Bill) or
+  // add/remove the slip from the bill to refresh.
+  bill_id: number | null;
+  bill_no: string | null;
+  // Current status. The form exposes it as a dropdown so the operator
+  // can manually override (e.g. flip billed → closed when they want
+  // to "unbill" a slip in place, instead of going through
+  // Change/Cancel Bill).
+  status: string;
 }
 
 interface DutySlipFormModalProps {
@@ -107,6 +118,9 @@ const EMPTY_FORM = {
   other_charges_remarks: '',
   driver_name:        '',
   driver_phone:       '',
+  // Status is a string here ('open'/'closed'/'billed') so RHF can
+  // bind it to a <select>. Empty means "let the server auto-derive".
+  status:             '',
 };
 
 const formSchema = z.object({
@@ -145,6 +159,12 @@ const formSchema = z.object({
   driver_phone:       z.string().optional().default('').refine(
     (v) => v === '' || /^\d{10}$/.test(v),
     'Driver phone must be 10 digits',
+  ),
+  // Status: optional string. Empty = "let the server auto-derive".
+  // Allowed values: 'open', 'closed', 'billed'.
+  status:             z.string().optional().default('').refine(
+    (v) => v === '' || ['open', 'closed', 'billed'].includes(v),
+    'Status must be open, closed, or billed',
   ),
 });
 
@@ -256,6 +276,7 @@ export function DutySlipFormModal({
         other_charges_remarks: initial.other_charges_remarks ?? '',
         driver_name:        initial.driver_name ?? '',
         driver_phone:       initial.driver_phone ?? '',
+        status:             initial.status ?? '',
       });
       setFlexibleItems(initial.custom_rate_items ?? []);
     } else {
@@ -386,6 +407,7 @@ export function DutySlipFormModal({
       p_other_charges_remarks: data.other_charges_remarks,
       p_driver_name:           data.driver_name,
       p_driver_phone:          data.driver_phone,
+      p_status:                data.status || null,
     };
     if (data.duty_type === 'flexible') {
       basePayload.p_custom_rate_items = flexibleItems.map((it) => ({
@@ -444,6 +466,37 @@ export function DutySlipFormModal({
         {submitError && (
           <div className="form-error form-error--server" role="alert" style={{ marginBottom: '0.5rem' }}>
             {submitError}
+          </div>
+        )}
+        {/* M10 — when editing a slip that's already on a bill, warn
+            the operator that saving leaves the bill's snapshotted
+            totals stale. They must cancel the bill or remove the slip
+            from the bill via Change / Cancel Bill to refresh. */}
+        {mode === 'edit' && initial?.bill_id != null && initial?.bill_no != null && (
+          <div
+            data-testid="ds-billed-warning"
+            role="alert"
+            style={{
+              marginBottom: '0.5rem',
+              padding: '0.6rem 0.8rem',
+              background: 'rgba(234, 179, 8, 0.15)',
+              border: '1px solid var(--color-warning)',
+              borderRadius: 'var(--radius-sm)',
+              fontSize: '0.9rem',
+              color: 'var(--color-text)',
+            }}
+          >
+            <strong>⚠ This slip is on bill <code>{initial.bill_no}</code></strong>
+            <br />
+            Saving will change this slip's values, but the bill's snapshotted totals will become stale.
+            After saving, open{' '}
+            <a
+              href="/daily-work/change-cancel-bill"
+              style={{ color: 'var(--color-accent)', textDecoration: 'underline' }}
+            >
+              Change / Cancel Bill
+            </a>{' '}
+            to either (a) remove this slip from the bill and re-add it (trigger recomputes), or (b) cancel the bill and re-bill it.
           </div>
         )}
 
@@ -506,6 +559,30 @@ export function DutySlipFormModal({
                   ))}
                 </select>
                 {errors.duty_type && <span className="form-error">{errors.duty_type.message}</span>}
+              </div>
+
+              {/* Manual status override. Empty = "let server auto-derive".
+                  Required to be a non-cancelled value because the SPA
+                  already hides Edit on cancelled rows. */}
+              <div className="form-field" style={{ flex: '1 1 180px' }}>
+                <label htmlFor="ds-status">Status</label>
+                <select
+                  id="ds-status"
+                  data-testid="ds-status-select"
+                  disabled={!canEdit}
+                  {...register('status')}
+                  aria-invalid={errors.status ? 'true' : 'false'}
+                >
+                  <option value="">— auto-derive —</option>
+                  <option value="open">open</option>
+                  <option value="closed">closed</option>
+                  <option value="billed">billed</option>
+                </select>
+                {errors.status
+                  ? <span className="form-error">{errors.status.message}</span>
+                  : <span style={{ fontSize: '0.78rem', color: 'var(--color-text-muted)' }}>
+                      Override the auto-derived value (saved → closed when both duty_end + closing_km are filled; else open).
+                    </span>}
               </div>
             </div>
 

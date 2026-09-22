@@ -3,7 +3,6 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
 import { supabase } from '../../services/supabaseClient';
-import { HybridDatePicker } from '../../components/HybridDatePicker';
 import { DutySlipFormModal } from './DutySlipFormModal';
 import type { DutySlipInitial } from './DutySlipFormModal';
 
@@ -42,6 +41,8 @@ interface DutySlipRow {
   other_charges: number | null;
   total_amount: number | null;
   rate_id: number | null;
+  bill_id: number | null;
+  bill_no: string | null;
   status: string;
   // Fields needed by the form's edit mode (not in the list RPC, but
   // carried over for the form pre-fill).
@@ -70,8 +71,14 @@ export function DutySlipListPage() {
   const queryClient = useQueryClient();
   const canEdit = role === 'owner' || role === 'operator';
 
-  const [filterFrom, setFilterFrom] = useState<string>('');
-  const [filterTo, setFilterTo] = useState<string>('');
+  // Digit-only slip_no range inputs (NULL = no bound). We compare
+  // NUMERICALLY against the slip_no's trailing digits (after "DS-")
+  // so "1" and "0001" both match "DS-0001".
+  const [slipNoFromDigits, setSlipNoFromDigits] = useState<string>('');
+  const [slipNoToDigits,   setSlipNoToDigits]   = useState<string>('');
+  const [appliedSlipRange, setAppliedSlipRange] = useState<{ from: number | null; to: number | null }>({
+    from: null, to: null,
+  });
   const [filterCustomerId, setFilterCustomerId] = useState<string>('all');
   const [filterVehicleId, setFilterVehicleId] = useState<string>('all');
   const [filterStatus, setFilterStatus] = useState<string>('all');
@@ -132,23 +139,59 @@ export function DutySlipListPage() {
     },
   });
 
+  // -- helpers ----------------------------------------------------------------
+  // Parse digit input as a number (handles "1" / "0001" / "45" all
+  // the same way). Empty → null (no bound).
+  const digitsToSlipNumber = (digits: string): number | null => {
+    const cleaned = digits.replace(/\D+/g, '');
+    if (cleaned === '') return null;
+    const n = parseInt(cleaned, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  // Extract the numeric tail of a duty_slip_no like "DS-0045" → 45.
+  const slipNoNumericTail = (slipNo: string): number => {
+    const m = slipNo.match(/(\d+)(?!.*\d)/);
+    if (!m) return -1;
+    const n = parseInt(m[1], 10);
+    return Number.isFinite(n) ? n : -1;
+  };
+
   // -- filtering --------------------------------------------------------------
   const filtered = useMemo(() => {
     const rows = slipsQuery.data ?? [];
     return rows.filter((r) => {
-      if (filterFrom && r.booking_date < filterFrom) return false;
-      if (filterTo && r.booking_date > filterTo) return false;
+      if (appliedSlipRange.from != null || appliedSlipRange.to != null) {
+        const n = slipNoNumericTail(r.duty_slip_no);
+        if (appliedSlipRange.from != null && n < appliedSlipRange.from) return false;
+        if (appliedSlipRange.to   != null && n > appliedSlipRange.to)   return false;
+      }
       if (filterCustomerId !== 'all' && String(r.customer_id) !== filterCustomerId) return false;
       if (filterVehicleId !== 'all' && String(r.vehicle_id) !== filterVehicleId) return false;
       if (filterStatus !== 'all' && r.status !== filterStatus) return false;
       return true;
     });
-  }, [slipsQuery.data, filterFrom, filterTo, filterCustomerId, filterVehicleId, filterStatus]);
+  }, [slipsQuery.data, appliedSlipRange, filterCustomerId, filterVehicleId, filterStatus]);
 
   // Reset to first page whenever filters change.
   useEffect(() => {
     setPage(0);
-  }, [filterFrom, filterTo, filterCustomerId, filterVehicleId, filterStatus]);
+  }, [appliedSlipRange, filterCustomerId, filterVehicleId, filterStatus]);
+
+  const handleApplySlipRange = () => {
+    const f = digitsToSlipNumber(slipNoFromDigits);
+    const t = digitsToSlipNumber(slipNoToDigits);
+    if (f != null && t != null && f > t) {
+      window.alert('From slip no. must be ≤ to slip no.');
+      return;
+    }
+    setAppliedSlipRange({ from: f, to: t });
+  };
+  const handleClearSlipRange = () => {
+    setSlipNoFromDigits('');
+    setSlipNoToDigits('');
+    setAppliedSlipRange({ from: null, to: null });
+  };
 
   // Client-side pagination (TAXI-810 MTP step 2: 20 rows/page + Next button).
   const pageCount = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
@@ -207,20 +250,111 @@ export function DutySlipListPage() {
             border: '1px solid var(--color-border)',
           }}
         >
-          <HybridDatePicker
-            id="filter-from"
-            label="Booking from"
-            value={filterFrom}
-            onChange={setFilterFrom}
-            testId="filter-from-today"
-          />
-          <HybridDatePicker
-            id="filter-to"
-            label="Booking to"
-            value={filterTo}
-            onChange={setFilterTo}
-            testId="filter-to-today"
-          />
+          {/* Slip-no range (digit-only inputs with auto-prepended "DS-"
+              prefix). Empty inputs + Search = show every slip. */}
+          <div className="form-field" style={{ minWidth: '160px' }}>
+            <label htmlFor="filter-slipno-from">Slip no. from</label>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                border: '1px solid var(--color-border)',
+                borderRadius: 'var(--radius-sm)',
+                background: 'var(--color-bg)',
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  padding: '0.45rem 0.4rem 0.45rem 0.7rem',
+                  color: 'var(--color-text-muted)',
+                  fontFamily: 'monospace',
+                  background: 'var(--color-surface-2)',
+                  borderRight: '1px solid var(--color-border)',
+                  borderTopLeftRadius: 'var(--radius-sm)',
+                  borderBottomLeftRadius: 'var(--radius-sm)',
+                }}
+              >
+                DS-
+              </span>
+              <input
+                id="filter-slipno-from"
+                type="text"
+                inputMode="numeric"
+                pattern="\d*"
+                value={slipNoFromDigits}
+                onChange={(e) => setSlipNoFromDigits(e.target.value.replace(/\D+/g, ''))}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleApplySlipRange(); }}
+                placeholder="0001"
+                data-testid="filter-slipno-from"
+                style={{
+                  flex: 1, padding: '0.45rem 0.6rem', background: 'transparent',
+                  color: 'var(--color-text)', border: 'none', fontFamily: 'monospace',
+                }}
+              />
+            </div>
+          </div>
+          <div className="form-field" style={{ minWidth: '160px' }}>
+            <label htmlFor="filter-slipno-to">Slip no. to</label>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                border: '1px solid var(--color-border)',
+                borderRadius: 'var(--radius-sm)',
+                background: 'var(--color-bg)',
+              }}
+            >
+              <span
+                aria-hidden="true"
+                style={{
+                  padding: '0.45rem 0.4rem 0.45rem 0.7rem',
+                  color: 'var(--color-text-muted)',
+                  fontFamily: 'monospace',
+                  background: 'var(--color-surface-2)',
+                  borderRight: '1px solid var(--color-border)',
+                  borderTopLeftRadius: 'var(--radius-sm)',
+                  borderBottomLeftRadius: 'var(--radius-sm)',
+                }}
+              >
+                DS-
+              </span>
+              <input
+                id="filter-slipno-to"
+                type="text"
+                inputMode="numeric"
+                pattern="\d*"
+                value={slipNoToDigits}
+                onChange={(e) => setSlipNoToDigits(e.target.value.replace(/\D+/g, ''))}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleApplySlipRange(); }}
+                placeholder="0050"
+                data-testid="filter-slipno-to"
+                style={{
+                  flex: 1, padding: '0.45rem 0.6rem', background: 'transparent',
+                  color: 'var(--color-text)', border: 'none', fontFamily: 'monospace',
+                }}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn--primary"
+            data-testid="filter-slipno-search-btn"
+            onClick={handleApplySlipRange}
+            disabled={slipsQuery.isFetching}
+            style={{ paddingBottom: '0.45rem' }}
+          >
+            Search
+          </button>
+          <button
+            type="button"
+            className="btn"
+            data-testid="filter-slipno-clear-btn"
+            onClick={handleClearSlipRange}
+            style={{ paddingBottom: '0.45rem' }}
+          >
+            Clear
+          </button>
           <div className="form-field" style={{ minWidth: '160px' }}>
             <label htmlFor="filter-customer">Customer</label>
             <select
@@ -292,6 +426,7 @@ export function DutySlipListPage() {
                   <th style={{ textAlign: 'right' }}>Total hours</th>
                   <th style={{ textAlign: 'right' }}>Total amount</th>
                   <th>Status</th>
+                  <th>Bill no.</th>
                   {canEdit && <th style={{ width: '110px' }}>Actions</th>}
                 </tr>
               </thead>
@@ -307,9 +442,21 @@ export function DutySlipListPage() {
                     <td style={{ textAlign: 'right' }}>{fmtHours(r.total_hours)}</td>
                     <td style={{ textAlign: 'right' }}>{fmtMoney(r.total_amount)}</td>
                     <td>{r.status}</td>
+                    <td>
+                      {r.bill_no ? (
+                        <Link
+                          to="/daily-work/change-cancel-bill"
+                          data-testid={`duty-slip-bill-${r.id}`}
+                          title="Open Change / Cancel Bill"
+                          style={{ color: 'var(--color-accent)', textDecoration: 'underline' }}
+                        >
+                          {r.bill_no}
+                        </Link>
+                      ) : '—'}
+                    </td>
                     {canEdit && (
                       <td style={{ display: 'flex', gap: '0.35rem', flexWrap: 'wrap' }}>
-                        {r.status !== 'cancelled' && r.status !== 'billed' && (
+                        {r.status !== 'cancelled' && (
                           <button
                             type="button"
                             className="btn"
@@ -350,6 +497,9 @@ export function DutySlipListPage() {
                                 driver_name: row.driver_name,
                                 driver_phone: row.driver_phone,
                                 custom_rate_items: Array.isArray(r.custom_rate_items) ? r.custom_rate_items : [],
+                                bill_id: r.bill_id,
+                                bill_no: r.bill_no,
+                                status: r.status,
                               });
                               setModalMode('edit');
                             })();
@@ -368,14 +518,16 @@ export function DutySlipListPage() {
                         >
                           🖨 Print
                         </button>
-                        <button
-                          type="button"
-                          className="btn"
-                          data-testid={`duty-slip-cancel-${r.id}`}
-                          onClick={() => void handleCancel(r)}
-                        >
-                          Cancel
-                        </button>
+                        {r.status !== 'cancelled' && (
+                          <button
+                            type="button"
+                            className="btn"
+                            data-testid={`duty-slip-cancel-${r.id}`}
+                            onClick={() => void handleCancel(r)}
+                          >
+                            Cancel
+                          </button>
+                        )}
                       </td>
                     )}
                   </tr>

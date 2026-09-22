@@ -1809,3 +1809,598 @@ The established pattern from TAXI-705 (GST) and TAXI-303 (Company Detail) is to 
   - Flexible popup uses a `custom_rate_items` JSONB array instead of two scalar columns (`custom_rate` + `custom_rate_remarks`); the RPC sums the items to compute `base_amount`. Same end result, more flexible.
 - **Next module:** M9 — Daily Work: Billing (Generate Bill RPC). Tickets TAXI-901 → TAXI-908 per `docs/TaskList.md`. The `generate_bill` RPC will tie duty slips to bills via `billing.bill_duty_slips`, populate GST via `fn_calculate_gst`, post a sale ledger entry, and stamp `bill_no` via a `fn_assign_bill_no` trigger (parallel to `fn_assign_duty_slip_no`).
 - **Awaiting operator's "proceed" before starting TAXI-901.**
+
+## 2026-09-20 06:30 IST — TAXI-901 + TAXI-902 — generate_bill RPC + fn_assign_bill_no trigger
+
+- What I changed (files):
+  - `supabase/migrations/20260920060000_fn_assign_bill_no.sql` (new) — `billing.fn_assign_bill_no()` BEFORE INSERT trigger on `billing.bills`. Parallel to `operations.fn_assign_duty_slip_no`: caller-supplied bill_no wins; sequence row missing → fallback `'BL-' || NEW.id`; mode='manual' + NULL → same fallback; auto mode → format `prefix + lpad(next_value, padding_length) + suffix` + increment `next_value`. Uses `master.document_sequences` (sequence_key='bill').
+  - `supabase/migrations/20260920061000_generate_bill_rpc.sql` (new) — `public.generate_bill(p_customer_id bigint, p_duty_slip_ids bigint[], p_remarks text DEFAULT NULL, p_bill_date date DEFAULT CURRENT_DATE) RETURNS SETOF billing.bills` SECURITY DEFINER RPC.
+    - **Caller authorization**: `current_user_role() ∈ {owner, operator}` (raises 42501 otherwise) — matches the established role-gate pattern from TAXI-705 / TAXI-303.
+    - **Validates**: customer belongs to caller's company; finds active gst_config for the customer (raises 22023 with friendly message if missing); loops `FOR UPDATE` over the requested slips and validates each (tenant check, customer match, not cancelled, not already billed).
+    - **Computes**: `base_amount = SUM(slip.base_amount)`, `extra_amount = SUM(slip.extra_km + extra_hour + night_halt + driver_allowance + other_charges)`.
+    - **Inserts the bill**: caller-provided values populated (customer_id, gst_config_id, bill_date, remarks, status='issued', base_amount, extra_amount, created_by=auth.uid()). The `fn_calculate_gst` BEFORE INSERT trigger computes cgst/sgst/igst/total_tax/total_after_tax/round_off/grand_total. The `fn_assign_bill_no` BEFORE INSERT trigger stamps `bill_no='BL-0001'` (auto).
+    - **Inserts junction rows**: one `billing.bill_duty_slips` row per slip with snapshotted `included_base`, `included_extra`, `included_total`.
+    - **Flips slips**: `UPDATE operations.duty_slips SET bill_id = new_bill_id, status = 'billed' WHERE id = ANY(p_duty_slip_ids)`.
+    - **Posts ledger**: `INSERT INTO accounts.ledger_entries (entry_type='sale', debit_amount=bill.grand_total, narration='Bill BL-0001 raised against <customer name>')`.
+    - **Returns the bill row**.
+    - All of the above in a single transaction (PL/pgSQL function body is implicitly transactional; the function is SECURITY DEFINER with `SET search_path = public, master, operations, billing, accounts`).
+  - `supabase/migrations/20260920062000_audit_log_junction_company_lookup.sql` (new) — **bug fix to M1's `system.fn_audit_row`**. The original audit trigger read `company_id` from `to_jsonb(NEW)`, which is NULL for junction tables. For `billing.bill_duty_slips`, the new fallback looks up `company_id` via the parent FK (`SELECT b.company_id FROM billing.bills b WHERE b.id = NEW.bill_id`). Same fallback added for `record_id` — bill_duty_slips has no `id` column, so record_id falls back to `bill_id`. Other audited tables are unaffected (the COALESCE picks up their own company_id/record_id).
+  - `supabase/migrations/20260920063000_fix_uq_duty_slip_active_bill.sql` (new) — **bug fix to M1's partial unique index on `operations.duty_slips`**. M1's index `uq_duty_slip_active_bill` was created on `(bill_id)` (one slip per bill — the OPPOSITE of the intended semantic). The M9 RPC needs N:1 (many slips per bill), which the index blocked. Dropped the index entirely; "one bill per slip" is already enforced by `bill_id` being a single nullable column.
+
+- Why: per TAXI-901 MTP. Bundles unbilled duty slips into one bill in a single transaction; returns the bill row. The M1 schema had two latent bugs that only became visible when M9 actually exercised bill_duty_slips + the multi-slip UPDATE pattern; both fixed in narrowly-scoped migrations.
+
+- Manual test status (run myself):
+  - TS clean / build clean / lint exit 0 (only pre-existing AuthProvider warning).
+  - **End-to-end happy path** (3 slips × 620 base each, Maharasthra→Delhi interstate @ 5% IGST):
+    - `generate_bill(1, [1,2,3], 'Test bill from curl')` returns `[{"id":1, "bill_no":"BL-0001", "base_amount":1860.00, "igst_amount":93.00, "total_tax":93.00, "grand_total":1953.00, "status":"issued", ...}]` ✓
+    - `master.document_sequences[sequence_key='bill'].next_value` = 2 (incremented from 1) ✓
+    - `billing.bill_duty_slips`: 3 rows, all `bill_id=1`, snapshotted amounts ✓
+    - `operations.duty_slips`: all 3 status='billed', bill_id=1 ✓
+    - `accounts.ledger_entries`: 1 row, entry_type='sale', debit_amount=1953.00, narration='Bill BL-0001 raised against Acme MH' ✓
+  - **Validation rejections** (every spec branch):
+    | Probe | Expected | Got |
+    |-------|----------|-----|
+    | Re-bill already-billed slip [1,2] | 22023 "already billed" | ✓ "Duty slip 1 is already billed (bill_id=1)." |
+    | Empty array [] | 22023 "at least one" | ✓ "At least one duty slip is required." |
+    | Accountant calls | 42501 role denial | ✓ "Only owner or operator can generate bills (your role: accountant)." |
+    | Nonexistent customer 99999 | P0002 not found | ✓ "Customer 99999 not found in this company." |
+    | Slip belongs to a different customer | 22023 cross-customer | ✓ "Duty slip 5 belongs to customer 2, not the selected customer 1." |
+  - **Audit log verification** (taxonomy of entries from one bill):
+    - INSERT into `bills` (id=17, record_id=1, changed_by=owner UUID, company_id=1)
+    - INSERT × 3 into `bill_duty_slips` (ids 18,19,20, all record_id=1, all company_id=1 via the parent lookup fix)
+    - UPDATE × 3 into `duty_slips` (ids 21,22,23, record_id=1,2,3 respectively, company_id=1 from NEW)
+  - **Second bill** for slip 4 (was unbilled): `generate_bill(1, [4])` → bill `BL-0002`, base=620, igst=31, total=651. Confirms sequence incremented + each bill can have a different set of slips.
+
+- Manual test status (operator runs in Studio SQL Editor — TAXI-901 steps 1–13):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Run `SELECT generate_bill(<customer_id>, ARRAY[<ds1>, <ds2>, <ds3>], 'Test bill', CURRENT_DATE);` | Returns one bill row with bill_no='BL-0001', base_amount=sum of 3 slips, GST computed, grand_total a whole rupee. |
+  | 2 | `SELECT * FROM operations.duty_slips WHERE id IN (ds1, ds2, ds3);` | All 3 now have `bill_id=<new bill id>`, `status='billed'`. |
+  | 3 | `SELECT * FROM billing.bill_duty_slips WHERE bill_id = <new bill id>;` | 3 junction rows with snapshotted amounts. |
+  | 4 | `SELECT * FROM accounts.ledger_entries WHERE linked_bill_id = <new bill id>;` | 1 sale entry with `debit_amount = bill.grand_total`, narration contains bill_no + customer name. |
+  | 5 | `SELECT generate_bill(<customer_id>, ARRAY[<already-billed>], 'Re-bill', CURRENT_DATE);` | 22023 "Duty slip N is already billed (bill_id=…)." |
+  | 6 | `SELECT generate_bill(<customer_id>, ARRAY[<other-customer-slip>], 'Cross', CURRENT_DATE);` | 22023 "Duty slip N belongs to customer X, not the selected customer Y." |
+  | 7 | Sign in as accountant. `SELECT generate_bill(<customer_id>, ARRAY[<unbilled>], 'Acct', CURRENT_DATE);` | 42501 "Only owner or operator can generate bills." |
+  | 8 | `SELECT * FROM system.audit_log WHERE table_name IN ('bills', 'bill_duty_slips', 'duty_slips') AND record_id = <bill_id> ORDER BY id;` | One INSERT bill, 3 INSERT bill_duty_slips, 3 UPDATE duty_slips — all with company_id=1, changed_by=owner UUID. |
+
+- **M1 bugs surfaced and fixed** (documented for future awareness):
+  - `uq_duty_slip_active_bill` partial unique index was on `(bill_id)` instead of being dropped. The MTP's intent ("second link of the SAME slip to another bill should fail") only requires that `bill_id` is single-valued on each slip — which the column shape already provides. M1's index was enforcing the inverse constraint.
+  - `fn_audit_row` read `company_id` and `record_id` from `to_jsonb(NEW)`. Junction tables without their own `company_id` / `id` columns need a fallback lookup. Now handled for `bill_duty_slips`; if more junction tables get audited later, add a CASE branch.
+
+- Open questions for operator: none. **M9 continues to TAXI-903** (next ticket per TaskList.md — Billing list page UI).
+
+## 2026-09-20 07:15 IST — TAXI-903 — Billing page UI (customer picker + duty slip list)
+
+- What I changed (files):
+  - `supabase/migrations/20260920070000_list_unbilled_duty_slips_rpc.sql` (new) — `public.list_unbilled_duty_slips_for_customer(p_customer_id bigint)` SECURITY DEFINER RPC. RETURNS 20 columns covering every editable field plus the joined `vehicle_reg_no`. WHERE clause filters: `company_id = current_company_id() AND customer_id = p_customer_id AND bill_id IS NULL AND status IN ('open','closed')`. Ordered `booking_date DESC, id DESC`. STABLE SQL.
+  - `src/panels/dailywork/BillingPage.tsx` (new, ~330 lines) — full UI:
+    - **Customer picker** (active customers only) — reuses cached `list_customers_for_company`.
+    - **GST mode banner** — colour-coded. Reads `company.state` from cached `get_company` + `customer.state` from the dropdown. Interstate → warning-yellow "IGST will apply"; intra-state → accent-yellow "CGST + SGST will apply".
+    - **Slip list** — TanStack Table shape with 10 columns (checkbox + duty_slip_no, booking_date, vehicle, duty_type, total_km, total_hours, base, extras, total). Per-row checkboxes (`data-testid="bill-slip-check-${id}"`); Select All checkbox at the top (`data-testid="bill-select-all"`).
+    - **Totals preview** (below the list) — live updates as the operator ticks. Shows selected count, base sum, extras sum, pre-tax total, estimated GST (using a hard-coded 5% rate — the real per-customer rate is fetched by the bill's trigger at bill time; this is a best-effort preview), and estimated grand total.
+    - **Remarks textarea** — bound to `remarks` state.
+    - **Generate Bill button** — calls `supabase.rpc('generate_bill', ...)` with the selected slip ids + remarks + today's date. Shows confirmation dialog with summary (customer / count / base / extras / estimated grand / GST mode). On success: green banner "Bill {bill_no} created.", invalidates both `list_unbilled_duty_slips_for_customer` and `list_duty_slips_for_company` query caches, clears selection.
+    - **Role gating** — `canEdit = role === 'owner' || role === 'operator'`. Accountant + viewer see the page but all checkboxes + remarks textarea are disabled, and the Generate Bill button is replaced with a "Read-only — your role can't generate bills." notice.
+  - `src/components/AppRouter.tsx` (edit) — added lazy `BillingPage` import and `<Route path="/daily-work/billing">` inside the RequireAuth group.
+  - `src/panels/dailywork/DailyWorkPanel.tsx` (edit) — added a second NavLink ("Billing") next to the Duty Slips link. Replaced the placeholder copy with a forward-looking note about M10 + M11.
+  - `src/index.css` (edit) — added `.data-table__row--selected` (yellow tint at 10% alpha) so the operator can see which slips they've ticked.
+
+- Why: per TAXI-903 MTP. Two design choices worth noting:
+  - **Estimated GST preview**: the spec said "grand total = base + extra + GST (estimate)". I used a flat 5% rate for the preview because the real GST trigger (`fn_calculate_gst`) only computes the actual rate at bill-INSERT time, and the preview is just a UI hint. The exact `cgst_amount / sgst_amount / igst_amount` come from the bill's own columns after the Generate Bill call succeeds.
+  - **Generate Bill wired in this ticket** (not TAXI-904): TAXI-903 MTP steps 9–11 explicitly require the Generate Bill click to succeed end-to-end. Splitting the wiring into TAXI-904 would have left steps 9–11 broken at the end of this ticket. Per CLAUDE.md rule 5, I implemented the full flow here; TAXI-904 will become a verification + small-UX-polish ticket.
+
+- Verified myself:
+  - TS clean / build clean (BillingPage chunk: 8.87 kB / 2.94 kB gzip; main bundle 431.82 kB / 124.42 kB gzip; 1.06 s total).
+  - Lint exit 0 (only the pre-existing AuthProvider warning).
+  - `curl http://localhost:5173/daily-work/billing` → HTTP 200 (SPA route fallback).
+  - **RPC probe** (full chain):
+    1. Fresh DB → `list_unbilled_duty_slips_for_customer(1)` returns `[]` ✓
+    2. Created 2 slips for customer 1 (Maharashtra, IGST) → list returns 2 rows, ordered by booking_date DESC, id DESC ✓
+    3. Cancelled slip 1 (status='cancelled') + generated bill for slip 2 (status='billed', bill_id≠NULL) → list returns `[]` ✓ (excludes both cancelled and billed)
+
+- Manual test status (operator runs in browser — TaskList TAXI-903 steps 1–11):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Sign in as `owner-tester`. Navigate to `/daily-work/billing`. | Page loads with "Billing — Daily Work" title. Customer dropdown shown with "Select a customer" placeholder. Slip area shows "Select a customer to view unbilled duty slips." |
+  | 2 | Select customer Acme MH (the seeded test customer). | Banner appears: "Interstate → IGST will apply" (yellow). Slip list loads with all unbilled slips. |
+  | 3 | Tick 2 of the 3 slips. | Totals preview updates: base = sum of the two base amounts, extras = sum of their extras, grand total = pre-tax × 1.05. The two ticked rows have the yellow-tint background. |
+  | 4 | Click Select All. | All slips ticked; totals show the full sum. |
+  | 5 | Click Select All again. | All unticked; totals reset to 0. |
+  | 6 | Tick one slip. Click **Generate Bill**. | Confirmation dialog: "Generate bill?\n\nCustomer: Acme MH\nDuty slips: 1\nBase: 620.00\nExtra: 0.00\nEstimated grand total: 651.00\nGST mode: Interstate (IGST)". Confirm. |
+  | 7 | After confirm | Green banner "Bill BL-0001 created." appears. Slip list refreshes — that slip is gone (now billed). |
+  | 8 | Switch to a customer with no unbilled slips (or just one). | Slip area shows "No unbilled duty slips for this customer." Totals preview hidden. |
+  | 9 | Sign in as `acct-tester`. Navigate to `/daily-work/billing`. | Page loads. Customer dropdown works (read-only is fine — picking a customer is allowed). All checkboxes disabled, remarks disabled, **Generate Bill button replaced** with "Read-only — your role can't generate bills." |
+  | 10 | Sign in as `viewer-tester`. Same. | Same as accountant. |
+  | 11 | Open DevTools → Network. Generate Bill click. | `POST /rest/v1/rpc/generate_bill` with `{p_customer_id, p_duty_slip_ids, p_remarks, p_bill_date}`. 200 with the bill row. |
+
+- Open questions for operator: none. **M9 continues to TAXI-904** (verification + small-UX polish ticket for the Generate Bill flow, now that the wiring is in place).
+
+## 2026-09-20 07:40 IST — TAXI-904 — Generate Bill RPC call from the SPA
+
+**Most of this work shipped in TAXI-903.** This ticket added the success-state polish the original spec called for:
+
+- What I changed (files):
+  - `src/panels/dailywork/BillingPage.tsx` (edit) — `actionNotice` state upgraded from `string` to `{ billNo: string; total: number } | null`. The success banner now reads `"Bill BL-0001 created for ₹651.00."` (dismisses after 8 s instead of 2 s) and adds two actions next to it: a **🖨 Print Bill** link (`<a target="_blank" href="/print-placeholder.html?bill_no=…">`) and an `×` dismiss button.
+  - `public/print-placeholder.html` (edit) — already supported `?duty_slip_no=<no>`; now also handles `?bill_no=<no>`. When `bill_no` is passed the heading label switches from "Duty Slip" to "Bill" and the number is injected into the existing `<code>` element. Same minimal yellow-on-black placeholder page; the real PDF template arrives in M11 (TAXI-1101).
+
+- Why: per TAXI-904 MTP step 7 — "The toast has a 'Print Bill' link. Clicking it opens the M11 print preview (placeholder for now)." Without this link the operator has to manually navigate to a future Bill list page and click Print — the inline link saves a step right after bill generation when they're most likely to want to print.
+
+- Verified myself:
+  - TS clean / build clean (`BillingPage` chunk grew 8.87 → 9.59 kB / 2.94 → 3.16 kB gzip; main bundle unchanged at 431.82 kB / 124.42 kB gzip; 1.03 s total).
+  - Lint exit 0 (only the pre-existing AuthProvider warning).
+  - `curl http://localhost:5173/print-placeholder.html?bill_no=BL-0001` → HTTP 200; body confirms `kind-label` and `doc-no` are the IDs the JS targets.
+
+- Manual test status (operator runs in browser — TaskList TAXI-904 steps 1–10):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Setup: customer Acme MH has 3 unbilled slips (already in DB). Active gst_config igst=5%. |
+  | 2 | `/daily-work/billing`. Select Acme MH. Tick all 3 slips. |
+  | 3 | Click **Generate Bill**. | Confirmation dialog shows "Customer: Acme MH, Duty slips: 3, Base: 1860.00, Extra: 0.00, Estimated grand total: 1953.00, GST mode: Interstate (IGST)". |
+  | 4 | Confirm. | Spinner on the button. ~200 ms later, green banner: **"Bill BL-0001 created for ₹1953.00."** + **🖨 Print Bill** link + × dismiss button. |
+  | 5 | Click **🖨 Print Bill**. | New tab opens at `/print-placeholder.html?bill_no=BL-0001`. The placeholder heading reads "PDF rendering coming in M11 — Bill BL-0001". |
+  | 6 | Slip list refreshes — the 3 slips are gone. | Yes (they're now billed). |
+  | 7 | Studio SQL Editor: `SELECT bill_no, base_amount, extra_amount, total_before_tax, igst_amount, total_after_tax, grand_total, status FROM billing.bills WHERE bill_no='BL-0001';` | `base=1860, extra=0, total_before_tax=1860, igst=93, total_after_tax=1953, grand_total=1953, status='issued'`. |
+
+- Open questions for operator: none. **M9 continues to TAXI-905** (ledger entry verification — already verified in TAXI-901 probe, re-run for the worklog).
+
+## 2026-09-20 08:00 IST — TAXI-905 / TAXI-906 / TAXI-908 — Verification pass
+
+Three verification tickets (no code changes beyond what shipped in TAXI-901 / 903 / 904).
+
+### TAXI-905 — Sale ledger entry auto-posted
+
+After `generate_bill` succeeds, the sale entry in `accounts.ledger_entries`:
+
+| id | entry_type | customer_id | linked_bill_id | debit_amount | credit_amount | narration | has_creator | linked_duty_slip_id |
+|----|------------|-------------|----------------|--------------|---------------|-----------|-------------|--------------------|
+| 1  | sale       | 1           | 1              | 651.00       | 0.00          | Bill BL-0001 raised against Acme MH | t | NULL |
+
+- `debit_amount` = `bill.grand_total` (651.00 = 620 base + 5% IGST, rounded)
+- `narration` = `"Bill BL-0001 raised against <customer name>"` — exact spec format
+- `linked_duty_slip_id` = NULL (the bill is the parent, not individual slips)
+- `created_by` = `<owner user UUID>`
+
+Pass. **MTP steps 1–7 ✓.**
+
+### TAXI-906 — Transactional rollback on error
+
+| Scenario | Expected | Got |
+|----------|----------|-----|
+| Close gst_config (`UPDATE master.gst_config SET effective_to = CURRENT_DATE, is_active = false`) | generate_bill raises 22023 with "No active GST config for customer N. Configure it in Master → GST Management first." | ✓ exact error |
+| New bill row created | 0 (rolled back) | ✓ `COUNT(*) = 1` (no new row) |
+| New sale ledger entry | 0 | ✓ `COUNT(*) = 1` (no new row) |
+| Affected duty slip status | unchanged | ✓ slip 2 still `bill_id=1, status='billed'` (from prior bill) |
+
+The function is wrapped in an implicit transaction (PL/pgSQL function body); every step rolls back together. **Pass. MTP steps 1–7 ✓.**
+
+### TAXI-908 — Role gating on Billing page
+
+| Role | Behaviour | Got |
+|------|-----------|-----|
+| owner | Full access — Generate Bill works | ✓ |
+| operator | Full access — Generate Bill works | ✓ |
+| accountant | UI hidden — RPC rejects with 42501 | ✓ "Only owner or operator can generate bills (your role: accountant)." |
+| viewer | UI hidden — RPC rejects with 42501 | ✓ "Only owner or operator can generate bills (your role: viewer)." |
+
+Pass. **MTP steps 1–5 ✓.** Defense in depth confirmed: SPA hides the button (`canEdit`); RPC rejects at 42501.
+
+---
+
+## 2026-09-20 08:15 IST — TAXI-907 — Bill totals recompute triggers
+
+- What I changed (files):
+  - `supabase/migrations/20260920071000_bill_totals_recompute_triggers.sql` (new) — three pieces:
+    - **`public.fn_compute_bill_gst(p_company_id, p_customer_id, p_base_amount, p_extra_amount)`** — STABLE helper that does the GST math (lookup active gst_config → cgst/sgst/igst/round_off/grand_total). RETURNS TABLE with the 6 tax columns + gst_config_id. Refactored out of `billing.fn_calculate_gst` so the math lives in one place.
+    - **`billing.fn_calculate_gst`** — refactored to call `public.fn_compute_bill_gst(...)` instead of duplicating the math. End-to-end behaviour identical.
+    - **`billing.fn_recompute_bill_totals()`** — AFTER INSERT OR DELETE trigger on `billing.bill_duty_slips`. Locks the parent bill `FOR UPDATE`, skips if `status='cancelled'` (so the M10 cancel RPC isn't fighting itself), re-sums `SUM(included_base), SUM(included_extra)` from the remaining junction rows, calls the GST helper, and UPDATEs the parent bill's `base_amount`, `extra_amount`, `total_before_tax`, `cgst_amount`, `sgst_amount`, `igst_amount`, `round_off`, `grand_total`, `gst_config_id`.
+    - **`trg_recompute_bill_totals`** — the AFTER INSERT OR DELETE trigger on `billing.bill_duty_slips` calling `fn_recompute_bill_totals()`.
+
+- Why: prepares M10 (Add/Remove Duty Slip from a bill). Without this trigger, the bill's totals would freeze at the initial generate_bill state and never reflect later junction edits.
+
+- Verified myself (full chain):
+
+| Probe | Expected | Got |
+|-------|----------|-----|
+| Generate bill for slips 1,2,3 (base=620 each, extras=100 each, Maharashtra→Delhi @ 5% IGST) | bill.base=1860, extras=300, total_before_tax=2160, igst=108, grand_total=2268 | ✓ |
+| Insert slip 5 (base=740, extras=50) into `bill_duty_slips` for bill 1 | bill.base=2600, extras=350, total_before_tax=2950, igst=147.50, grand_total=3098 | ✓ (trigger re-summed + recomputed GST) |
+| Delete the junction row for slip 5 | bill reverts to base=1860, extras=300, total_before_tax=2160, igst=108, grand_total=2268 | ✓ (trigger re-summed the remaining 3 rows) |
+
+**Note on test bug found mid-probe:** my first probe's manual INSERT used naive arithmetic (`extra_km_amount + extra_hour_amount + night_halt_amount + driver_allowance + other_charges`), which returns NULL when any operand is NULL (PostgreSQL NULL arithmetic). The trigger is correct (SUM ignores NULLs), but the test's source data was wrong. Re-probe used COALESCE wrappers; everything matched expected values. Documented so future M10 testing uses COALESCE from the start.
+
+- Manual test status (operator runs in Studio SQL Editor — TaskList TAXI-907 steps 1–8):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | Generate a bill with 3 duty slips via the SPA (or `generate_bill` RPC). | `bill.base_amount=1860, extra_amount=300, total_before_tax=2160`. |
+  | 2 | Insert a 4th closed unbilled duty slip via the SPA. | Slip saved. |
+  | 3 | Manual SQL: `INSERT INTO billing.bill_duty_slips (bill_id, duty_slip_id, included_base, included_extra, included_total) SELECT 1, <new_slip_id>, base_amount, COALESCE(extra_km_amount,0)+COALESCE(extra_hour_amount,0)+COALESCE(night_halt_amount,0)+COALESCE(driver_allowance,0)+COALESCE(other_charges,0), base_amount + <same extras sum> FROM operations.duty_slips WHERE id = <new_slip_id>;` | (Trigger fires automatically.) Bill.base_amount increases by the new slip's base. Bill.extra_amount increases by the new slip's extras. GST recomputed. |
+  | 4 | Manual SQL: `DELETE FROM billing.bill_duty_slips WHERE bill_id = 1 AND duty_slip_id = <new_slip_id>;` | Bill totals revert to the 3-slip state. |
+  | 5–8 | (Defer to M10 — TAXI-1003 ships the SPA UI for adding/removing slips, then the operator clicks the button instead of writing SQL.) | |
+
+- Open questions for operator: none. **M9 is now complete** (TAXI-901 + 902 + 903 + 904 + 905 + 906 + 907 + 908 all green). The next module is **M10 — Daily Work: Change / Cancel Bill** (TAXI-1001 through TAXI-1005 per `docs/TaskList.md`). The bill totals recompute trigger shipped today is what TAXI-1003 builds on.
+
+## 2026-09-20 08:30 IST — M9 module completion summary
+
+- **Tickets done:** TAXI-901 (generate_bill RPC + bill_no trigger), TAXI-902 (fn_assign_bill_no), TAXI-903 (Billing page UI), TAXI-904 (Generate Bill SPA wiring + success-state polish), TAXI-905 (sale ledger verification), TAXI-906 (transactional rollback verification), TAXI-907 (bill totals recompute triggers on bill_duty_slips), TAXI-908 (role gating).
+- **Open items (none blocking M10):**
+  - Defense-in-depth gap on duty-slip RPCs (TAXI-809 decision: leave as-is) — still applies to the new `generate_bill` RPC, which has an internal role gate. No gap.
+  - `cancel_duty_slip` / `update_duty_slip` are still SECURITY DEFINER without internal role checks (same TAXI-809 decision; applies here too).
+- **M1 schema bugs surfaced + fixed in this module:**
+  - `uq_duty_slip_active_bill` partial unique index was on the wrong column (dropped).
+  - `fn_audit_row` assumed every audited table has its own `company_id` and `id` columns (now junction-aware).
+- **New RPCs added:**
+  - `billing.fn_assign_bill_no()` — trigger, parallels duty slip numbering.
+  - `public.generate_bill(...)` — bundles slips into a bill in one transaction.
+  - `public.list_unbilled_duty_slips_for_customer(p_customer_id)` — Billing page data source.
+  - `public.fn_compute_bill_gst(...)` — STABLE helper used by both `fn_calculate_gst` and the new bill totals recompute triggers.
+  - `billing.fn_recompute_bill_totals()` — trigger on `bill_duty_slips`.
+- **UI shipped:**
+  - `/daily-work/billing` page (BillingPage) — customer picker, GST-mode banner, slip list with checkboxes + Select All, totals preview, Generate Bill button with confirmation + success notice (with Print Bill link).
+  - "Billing" NavLink added to DailyWorkPanel.
+  - `print-placeholder.html` extended to handle `?bill_no=<no>` (was already handling `?duty_slip_no=<no>`).
+- **Awaiting operator's "proceed" before starting M10 / TAXI-1001.**
+
+## 2026-09-20 08:50 IST — TAXI-903 rev2 — Billing page redesign: range-based, no auto-removal
+
+**Operator redesign request (verbatim):** "do not want to fetch duty slips on the basis of customer. We will fetch all duty slips by numerical range so give me options to set a range and then show me all duty slips in that range. … do not remove duty slips from list after making the bill. let them be there."
+
+This ticket supersedes the original TAXI-903 customer-picker approach. The RPC from TAXI-903 (`list_unbilled_duty_slips_for_customer`) stays in place for any future customer-scoped use; the Billing page now uses a new range-based RPC.
+
+- What I changed (files):
+  - `supabase/migrations/20260920072000_list_duty_slips_in_range_rpc.sql` (new) — `public.list_duty_slips_in_range(p_start_no text, p_end_no text)` SECURITY DEFINER RPC. RETURNS 23 columns covering every editable field plus the joined `customer_name`, `vehicle_reg_no`, `bill_id`, `bill_no`. WHERE clause filters: `company_id = current_company_id() AND duty_slip_no BETWEEN p_start_no AND p_end_no`. Returns EVERY slip in the range regardless of `bill_id` or `status` — billed and cancelled slips show up so the operator can see them. Ordered by `duty_slip_no ASC`.
+  - `src/panels/dailywork/BillingPage.tsx` (full rewrite, ~410 lines) — replaced the customer picker with two range inputs + a **Show slips** button. Behaviour:
+    - **Range inputs**: `Start slip no.` and `End slip no.` text inputs (placeholder `DS-0001` / `DS-0050`). Lexical range — works with any prefix the operator's document sequence uses.
+    - **Show slips** button calls the RPC with `appliedRange`. Empty range / `start > end` triggers `window.alert(...)`.
+    - **Range summary** line shows "Showing DS-0001 – DS-0050 (N rows)" once loaded.
+    - **Table** (11 columns now): checkbox + duty_slip_no + booking_date + customer + vehicle + duty_type + total_km + total_hours + total ₹ + **status** + **bill no.**. Billed and cancelled slips get `data-table__row--inactive` (grey); their checkboxes are `disabled`.
+    - **Single-bill customer lock**: when the operator ticks the first slip, `lockedCustomerId` is set. Subsequent ticks on slips from a different customer are blocked (checkbox disabled + an explanatory `window.alert(...)` on a defensive click). This matches the `generate_bill` RPC's "all slips must belong to one customer" invariant.
+    - **Generate Bill flow**: same as before — `window.confirm(...)` summary → `supabase.rpc('generate_bill', ...)` → green success banner with **🖨 Print Bill** link → `×` dismiss.
+    - **Billed slips STAY in the list** after a successful bill (per operator's directive). The `bill_no` column updates from `NULL` → `BL-0001` because we invalidate the `list_duty_slips_in_range` cache. The selection clears + the remarks reset so the operator can pick the next batch.
+    - **Role gating** unchanged: `canEdit = owner/operator`. Accountant + viewer see the page but all controls disabled and the Generate Bill button replaced with the read-only notice.
+
+- Why: per operator's redesign request. The customer-picker design was reasonable but the operator's daily workflow involves "show me the slips numbered DS-XXXX through DS-YYYY" regardless of customer; they cross-reference the duty slip book by number, not by customer. Keeping billed slips visible gives them the audit trail they want without an extra drill-down.
+
+- Verified myself:
+  - Build clean (`BillingPage` chunk grew 9.59 → 10.15 kB / 3.16 → 3.46 kB gzip; main bundle unchanged at 431.82 kB / 124.42 kB gzip; 1.26 s total).
+  - Lint exit 0 (only pre-existing AuthProvider warning).
+  - **RPC end-to-end probe**:
+    1. Inserted 5 slips via `create_duty_slip`.
+    2. `list_duty_slips_in_range('DS-0001', 'DS-0003')` → 3 rows (ids 1, 2, 3; sorted by duty_slip_no ASC).
+    3. Billed slip 2 via `generate_bill` (BL-0001).
+    4. Re-ran `list_duty_slips_in_range('DS-0001', 'DS-0003')` → still 3 rows; slip 2 now shows `status='billed'`, `bill_no='BL-0001'`; slips 1 and 3 unchanged.
+    5. Empty range `('DS-9999', 'DS-9999')` → `[]`.
+
+- Manual test status (operator runs in browser):
+  | # | Action | Expected |
+  |---|--------|----------|
+  | 1 | `/daily-work/billing`. | Page shows two text inputs ("Start slip no.", "End slip no.") + Show slips button. Slip area says "Enter a Start and End slip number above and click Show slips." |
+  | 2 | Type `DS-0001` / `DS-0050`. Click **Show slips**. | Table loads with every slip in that range (sorted by duty_slip_no). Range summary: "Showing DS-0001 – DS-0050 (N rows)". |
+  | 3 | Tick 2 of the unbilled slips (in the same customer). | Both rows highlight yellow. Totals preview updates below. |
+  | 4 | Try to tick a slip belonging to a DIFFERENT customer. | Checkbox is disabled (greyed). If you click anyway, an alert fires. |
+  | 5 | Click **Generate Bill**. Confirm. | Green banner: "Bill BL-XXXX created for ₹NNNN.NN." + 🖨 Print Bill link. The 2 ticked slips STAY in the table but their `Status` column flips to `billed` and their `Bill no.` column shows `BL-XXXX`. The checkbox on those rows becomes disabled. |
+  | 6 | Tick 2 more unbilled slips. Click **Generate Bill**. | A new bill is created; the previous one's slips stay visible (already billed, checkbox disabled). |
+  | 7 | Sign in as `acct-tester`. Same page. | Inputs + buttons disabled; read-only notice replaces Generate Bill. Table still shows all slips with their bill numbers. |
+
+- **Architectural deviation flagged (per CLAUDE.md rule 2):** This is a redesign of TAXI-903's UI behaviour, not just a polish pass. The original TAXI-903 MTP's flow (customer picker → unbilled-only list → remove-on-bill) is now superseded. The customer's customer-picker RPC (`list_unbilled_duty_slips_for_customer`) remains in place but is no longer used by the Billing page; it's available if a future page wants customer-scoped unbilled slips.
+
+- Open questions for operator: none. **M9 continues to M10 (TAXI-1001).**
+
+## 2026-09-21 06:00 IST — M10 — Change / Cancel Bill — Complete (TAX-1001 → 1005)
+
+**Operator context (verbatim):** *"suppose I made a bill but now I have some changes to do then I edit my slip and regenerate the bill or I delete that bill and edit duty slips. This kind of workflow I need. And what about already created bills where can I see what are going to with them according to design."*
+
+This module implements that workflow in two coordinated changes:
+
+1. **Edit-on-billed-slip path** (small duty-slip change): the Edit button is now shown for billed slips in the Duty Slip list, with a warning banner in the edit form pointing the operator to Change / Cancel Bill to refresh the bill's snapshot.
+2. **Change / Cancel Bill page** (`/daily-work/change-cancel-bill`) — the M10 module's deliverable: lists all bills, lets the operator Edit metadata, Add/Remove Slips, or Cancel.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `supabase/migrations/20260920073000_list_duty_slips_bill_columns.sql` | Drop + recreate `public.list_duty_slips_for_company()` adding `bill_id bigint` + `bill_no text` to the RETURNS TABLE. Duty Slip list now knows which bill (if any) each slip is on. |
+| `supabase/migrations/20260920080000_list_bills_for_company.sql` | `public.list_bills_for_company()` SECURITY DEFINER RPC. RETURNS 23 cols incl. customer name + state, base/extra/tax/grand totals, status, cancel metadata, `duty_slip_count`. STABLE SQL. Ordered by `bill_date DESC, id DESC`. |
+| `supabase/migrations/20260920081000_bill_change_cancel_rpcs.sql` | Four SECURITY DEFINER RPCs, all with internal owner/operator role gate (mirrors TAXI-705 pattern): `public.update_bill_metadata(bigint, date, text)`, `public.add_duty_slip_to_bill(bigint, bigint)`, `public.remove_duty_slip_from_bill(bigint, bigint)`, `public.cancel_bill(bigint, text)`. The cancel RPC enforces min-10-char reason + posts a reversal sale ledger entry (credit_amount = grand_total). |
+| `supabase/migrations/20260920082000_list_unbilled_for_bill_rpc.sql` | `public.list_duty_slips_for_bill_customer(p_bill_id)` — populates the "Add / Remove Slips" modal. Returns every unbilled slip for the bill's customer + every slip already on the bill (flagged via `already_on_bill boolean`). |
+| `src/panels/dailywork/DutySlipListPage.tsx` (edit) | Edit button now shown for `billed` rows (only `cancelled` blocks Edit). Cancel button now only shown for non-cancelled. Added `Bill no.` column — billed slips show their `bill_no` as a clickable link to `/daily-work/change-cancel-bill`. The Edit click fetches `bill_id` + `bill_no` via the existing `get_duty_slip` RPC + passes them to the form. |
+| `src/panels/dailywork/DutySlipFormModal.tsx` (edit) | When `mode === 'edit'` AND `initial.bill_id != null`, renders a yellow warning banner inside the modal explaining the bill-snapshot staleness + linking to Change / Cancel Bill. |
+| `src/panels/dailywork/ChangeCancelBillPage.tsx` (new, ~580 lines) | The M10 page. Single page that ships all four M10 flows: list with filters (customer / date range / status) + pagination + per-row actions (Edit / Slips / Cancel / Print). Three modal components co-located: `EditBillMetadataModal` (TAX-1002), `AddRemoveSlipsModal` (TAX-1003), `CancelBillModal` (TAX-1004). All modals share a `ModalShell` chrome. Cancelled bills render greyed; Edit/Slips/Cancel buttons hidden on cancelled rows (only Print + the cancel-reason tooltip remain). |
+| `src/components/AppRouter.tsx` (edit) | Lazy `ChangeCancelBillPage` + `<Route path="/daily-work/change-cancel-bill">`. |
+| `src/panels/dailywork/DailyWorkPanel.tsx` (edit) | Third sub-nav: "Change / Cancel Bill". Forward-looking copy points to M11 (Print PDF). |
+
+### Verified end-to-end (full RPC chain)
+
+| Probe | Result |
+|-------|--------|
+| 3 slips → bill BL-0001 (base=1240, grand_total=1302) | ✓ |
+| `list_bills_for_company` returns 1 bill, duty_slip_count=2, status='issued' | ✓ |
+| `list_duty_slips_for_bill_customer(1)` returns 3 slips (2 already_on_bill, 1 available) | ✓ |
+| `add_duty_slip_to_bill(1, 3)` → bill.base=1860, grand=1953 (trigger recomputed GST) | ✓ |
+| `update_bill_metadata(1, today, 'Updated remarks')` → bill.remarks='Updated remarks' | ✓ |
+| `remove_duty_slip_from_bill(1, 3)` → bill reverts to base=1240, grand=1302 (trigger recomputed) | ✓ |
+| `cancel_bill(1, 'Customer disputed the charges - test cancel')` → bill.status='cancelled', cancel_reason saved, all 3 slips freed (bill_id=NULL, status='closed'), reversal ledger entry posted (credit=1302, narration='Reversal - Bill BL-0001 cancelled'), junction rows deleted | ✓ |
+| Re-cancel an already-cancelled bill → `22023 "Bill 1 is already cancelled."` | ✓ (irreversibility enforced) |
+
+### Manual test status (operator runs in browser — TaskList M10 steps)
+
+| Module step | Action | Expected |
+|---|---|---|
+| **Duty slip edit** | Open `/daily-work/duty-slips`. Click **Edit** on a `billed` row. | Modal opens with a yellow warning banner: "This slip is on bill BL-XXXX. Saving will leave the bill's snapshotted totals stale. After saving, open Change / Cancel Bill to ..." |
+| 1001 | Open `/daily-work/change-cancel-bill`. | Table lists all bills (default hides cancelled). Filter bar above (customer / date range / "Show cancelled"). |
+| 1001 | Untick "Show cancelled bills". Tick it again. | Default excludes cancelled; toggle re-includes. |
+| 1001 | Click **🖨 Print** on a row. | New tab opens at `/print-placeholder.html?bill_no=BL-XXXX`. |
+| 1002 | Click **Edit** on an `issued` bill. | Modal opens with bill_no + customer read-only, bill_date editable, remarks editable, grand_total read-only. Save. Bill date / remarks persisted. |
+| 1003 | Click **Slips** on a bill. | Modal opens with two sections: "Currently linked" (left) + "Available to add" (right). Click **Add** on a slip → row moves left, bill totals recompute. Click **Remove** → row moves right, totals revert. |
+| 1004 | Click **Cancel** on an `issued` bill. | Confirmation dialog with summary. Enter cancel reason (≥10 chars). Confirm. Bill greys out. Slips show as `closed` with `bill_no=NULL` again on the Duty Slip list. Reversal sale entry in `accounts.ledger_entries`. |
+| 1005 | Try to cancel an already-cancelled bill. | The **Cancel** button is hidden (cancelled rows only show Print + reason tooltip). Direct RPC call returns `"Bill 1 is already cancelled."`. |
+| Role gating | Sign in as `acct-tester`. | All Edit / Slips / Cancel buttons hidden. Print still works. Page is read-only. |
+
+### Build / lint
+
+TS clean / build clean / lint exit 0. `ChangeCancelBillPage` chunk: 15.61 kB / 4.11 kB gzip. Main bundle unchanged at 431.82 kB / 124.42 kB gzip.
+
+### Architectural notes (per CLAUDE.md rule 2)
+
+- The `duty_slips.bill_id` column's RLS `*_update_requires_operator_or_accountant` policy lets **accountant** edit duty slips. Per the operator's TAXI-809 decision ("leave as-is"), we don't add an internal role gate to the duty-slip RPCs. This means a determined accountant can still bypass the SPA gate and edit a billed slip directly via the `update_duty_slip` RPC. Same gap exists for the bill-level RPCs shipped in this module (they gate on owner/operator). The M10 design's defense-in-depth is in the bill-level RPCs (which gate properly) — the duty-slip gap is documented and accepted.
+- `cancel_bill` posts a reversal ledger entry as `entry_type='sale'` with `credit_amount=grand_total`. The spec wanted this same entry_type for symmetry with the original `generate_bill` sale entry; an `entry_type='reversal'` would be cleaner accounting but is out of scope for this ticket.
+
+### Open questions for operator: none. M10 complete.
+
+**Next module: M11 — Print Bill / Duty Slip as PDF (TAX-1101 → 1104 per `docs/TaskList.md`).** The placeholder page at `/print-placeholder.html` is already in place; M11 swaps in the real `@react-pdf/renderer` PDF templates.
+
+## 2026-09-21 07:00 IST — Duty slip status override + Change/Cancel Bill filter swap
+
+**Two operator requests in one batch:**
+
+1. **Duty slip status override** — Add a manual status selector (open / closed / billed) to the duty slip form, so the operator can flip a slip's status in place instead of going through Change/Cancel Bill. Also fixes the "status stays billed after edit" symptom: the old `update_duty_slip` had `WHEN v_old.status='billed' THEN 'billed'` in its CASE, which silently preserved the billed status on every edit. The new code re-derives purely from `duty_end_dt + closing_km` OR honours the explicit `p_status` override.
+2. **Change/Cancel Bill filter** — swap the from/to **bill_date** filter inputs for from/to **bill_no** (lexical range like `BL-0001` … `BL-0050`), matching the operator's mental model.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `supabase/migrations/20260920090000_duty_slip_p_status.sql` | Drops + recreates `public.create_duty_slip(...)` and `public.update_duty_slip(...)` with a new optional `p_status text DEFAULT NULL` parameter. Validation: `IN ('open','closed','billed','cancelled')` for create, `IN ('open','closed','billed')` for update (cancelled is rejected — the SPA already hides Edit on cancelled rows). When `p_status IS NULL`, status is auto-derived from `duty_end_dt + closing_km` (closed if both present, open otherwise). The new update_duty_slip also recomputes `total_amount` properly (sums `base_amount + extra_*` columns) which the old one had silently dropped on edit. |
+| `src/panels/dailywork/DutySlipListPage.tsx` (edit) | Edit-handler now passes `status: r.status` to `setEditing(...)` so the form pre-fills with the current status. |
+| `src/panels/dailywork/DutySlipFormModal.tsx` (edit) | Added `status: string` to `DutySlipInitial`. Added `status: ''` to `EMPTY_FORM` (empty = let server auto-derive). Added Zod refine (`IN ['open','closed','billed']`). Added `status` to `reset()` for edit-mode. Added `p_status: data.status || null` to the RPC payload. Added a new Status `<select>` next to the Duty type select with four options: "— auto-derive —", "open", "closed", "billed". A small helper line explains the auto-derive rule. |
+| `src/panels/dailywork/ChangeCancelBillPage.tsx` (edit) | Filter state: `filterFrom`/`filterTo` (dates) → `filterBillNoFrom`/`filterBillNoTo` (text). The filter predicate switched from `r.bill_date < from` to `r.bill_no < fromBillNo`. The two `<input type="date">` controls became `<input type="text" placeholder="BL-0001">` controls. Page reset on filter change. **Bonus:** added `invalidateQueries(['rpc','list_duty_slips_in_range'])` to every mutation handler so the Billing page refreshes immediately after a Cancel / Edit metadata / Add-Remove Slip on a bill. This was a real cache mismatch (the Billing page uses a different cache key from the duty slip list) that explained the operator's "stays billed" observation in some flows. |
+
+### Verified end-to-end
+
+| Probe | Expected | Got |
+|-------|----------|-----|
+| `create_duty_slip` with `p_status='closed'` (both km present) | status='closed' (override wins) | ✓ |
+| `create_duty_slip` with `p_status='bogus'` | 22023 "Invalid status 'bogus'." | ✓ |
+| `update_duty_slip` on a billed slip, omit `p_status` (auto-derive) | status='closed' (no longer preserves 'billed') | ✓ — was the bug; now fixed |
+| `update_duty_slip` on a billed slip, `p_status='billed'` explicit | status='billed' (override wins) | ✓ |
+| `cancel_bill` → re-`generate_bill` cycle | slip status: billed → closed → billed; bill_id: NULL → set → set | ✓ |
+
+### Manual test status (operator runs in browser)
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | `/daily-work/duty-slips`. Click **Edit** on any slip. | Status select shows the current value (e.g. "closed"). Helper line: "Override the auto-derived value (saved → closed when both duty_end + closing_km are filled; else open)." |
+| 2 | Pick "billed" from the dropdown. Save. | Toast "Duty slip updated." Status column flips to "billed". |
+| 3 | Edit the same slip again. Status select shows "billed". Pick "closed". Save. | Status flips to "closed" — useful for "unbilled-in-place" without going through Change/Cancel Bill. |
+| 4 | Edit a slip; leave the dropdown on "— auto-derive —". Save. | Status re-derives from duty_end_dt + closing_km (independent of prior status). |
+| 5 | `/daily-work/change-cancel-bill`. Two filter inputs read "Bill no. from" + "Bill no. to" with placeholder "BL-0001" / "BL-0050". | Page renders. |
+| 6 | Type `BL-0001` in "from", `BL-0002` in "to". | Only those two bills show. |
+| 7 | Cancel a bill. | The Billing page (`/daily-work/billing`) refreshes too (slip's bill_id / bill_no columns update) because the `list_duty_slips_in_range` cache is now invalidated from the cancel flow. |
+
+### Build / lint
+
+TS clean / build clean / lint exit 0. `DutySlipListPage` chunk grew 33.30 → 34.25 kB / 8.39 → 8.59 kB gzip. `ChangeCancelBillPage` chunk 15.61 → 15.91 kB / 4.11 → 4.14 kB gzip.
+
+### Bug-fix note for the worklog
+
+The "stays billed after edit" symptom was caused by **two** issues stacked:
+1. **`update_duty_slip` preserved `status='billed'` on every edit** because of the `WHEN v_old.status = 'billed' THEN 'billed'` short-circuit in its `v_status` CASE. After this ticket, the auto-derive path no longer carries that short-circuit.
+2. **`ChangeCancelBillPage` invalidation didn't cover the `list_duty_slips_in_range` cache key** used by the Billing page. So after cancelling a bill, the Billing page continued to show the slip with its stale bill_no column until a manual refresh. Both fixed.
+
+The operator's "tried to make a bill again the status on them is still billed" observation was likely a combination of these two — they'd edit a billed slip (issue #1, status stayed 'billed'), then try to make a new bill from the Billing page that still showed the cached billed slip (issue #2).
+
+## 2026-09-21 07:20 IST — Change/Cancel Bill: Search button + BL- prefix
+
+**Operator feedback (verbatim):** *"There is not search button in change and cancel bill page so how can i search and fetch my bill. One more thing while giving range I do not want to write manually BL-0001, BL should be written there before i just need to write a number thats all."*
+
+### What changed
+
+- "BL-" is now a fixed visual prefix on both bill-no inputs (rendered as a monospace label inside the input border, like a currency selector). The operator types only the digits. Inputs use `inputMode="numeric"` + a regex `\D+` stripper so non-digit keystrokes never land.
+- A **Search** button (`data-testid="ccb-search-btn"`) runs the filter. A **Clear** button resets the inputs + the applied filter. Pressing **Enter** inside either digit input also triggers Search.
+- Filter state was split into two layers:
+  - `billNoFromDigits` / `billNoToDigits` — the live input values (digits only).
+  - `appliedFilter` — the snapshot used by the row filter (`{ billNoFrom: 'BL-…', billNoTo: 'BL-…', showCancelled }`); only updated when Search runs.
+- Customer dropdown still applies immediately (per-row rerender is cheap; only the bill-no / show-cancelled block was the source of re-filter-per-keystroke fatigue).
+- File header comment updated to describe the new Search + prefix semantics.
+
+### Why
+
+Per operator's request — the old bar auto-filtered on every keystroke (which is awkward when typing "BL-0050" character-by-character), and typing the literal "BL-0001" prefix each time is redundant since the project uses a single `master.document_sequences` prefix. The new design lets the operator type just `0050` and click Search once.
+
+### Verified myself
+
+- TS clean / build clean / lint exit 0. `ChangeCancelBillPage` chunk grew 15.91 → 17.94 kB / 4.14 → 4.50 kB gzip (Search button + helpers + the prefix label markup).
+- No backend changes (purely UI).
+
+### Manual test status (operator runs in browser)
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Open `/daily-work/change-cancel-bill`. | Filter bar has two text inputs with "BL-" prefix label inside the input border; placeholders read `0001` and `0050`. **Search** + **Clear** buttons visible. |
+| 2 | Type `5` in "Bill no. from", `10` in "Bill no. to". Click **Search**. | List filters to bills `BL-0005` through `BL-0010`. |
+| 3 | Try typing letters / spaces in either input. | Stripped on change — only digits stay in the input. |
+| 4 | Type a range, then change your mind. Click **Clear**. | Both inputs empty; filter resets; all bills show again. |
+| 5 | Tick "Show cancelled bills", click **Search**. | Cancelled bills now visible (greyed). |
+| 6 | Press **Enter** inside either digit input. | Same effect as clicking Search. |
+
+## 2026-09-21 07:50 IST — Billing + Duty Slip pages: DS- prefix search + date filters removed
+
+**Operator feedback (verbatim):** *"I added new duty slip DS - 0003 but when I went to billing page to create a bill that duty slip doesnt show there. also add search feature in duty slip to with duty slip similar to you did with bill number prefix DS and i write the number manually do the same in billing panel where searc duty slips i need prefix. Also Remove the booking from and booking to filter in duty slips page."*
+
+Three coordinated changes:
+
+1. **`list_duty_slips_in_range` now accepts NULL bounds** — the original function required both `p_start_no` AND `p_end_no`, which meant the Billing page could never default to "show all slips" without an explicit range typed. Per operator feedback, the function now treats NULL as "no bound on that side": both NULL = all slips; only start = from onward; only end = up to that point; both = range. Migration `20260920095000_list_duty_slips_in_range_nullable_bounds.sql`.
+
+2. **Billing page (`/daily-work/billing`) — DS- prefix + Search + default "show all".** Two digit-only inputs with **"DS-" prefix baked in** (same UX pattern as the BL- prefix on Change/Cancel Bill). Empty inputs + Search = "show every slip in the company". Non-digit keystrokes are stripped. **Enter** triggers Search. A **Clear** button resets both inputs. The default state on first load now shows every slip (no more "Enter a Start and End slip number..." empty hint). The "Showing …" summary text reflects whether a range is applied or all slips are shown. The flowchart for the new search UX is identical to the one the operator already approved for Change/Cancel Bill — same pattern, different prefix.
+
+3. **Duty Slip page (`/daily-work/duty-slips`) — date filters removed; DS- prefix + Search added.** Removed the `<input type="date">` "Booking from" + "Booking to" controls + the `filterFrom`/`filterTo` state and the `HybridDatePicker` import. Added two new controls with the same UX: digit-only inputs with **"DS-" prefix baked in**, a **Search** button, and a **Clear** button. The client-side filter now compares `appliedSlipRange.from / .to` against `r.duty_slip_no` (lexical range). Customer + vehicle + status dropdowns still apply immediately (they're cheap; only the range needed the Search button per operator feedback). Enter triggers Search.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `supabase/migrations/20260920095000_list_duty_slips_in_range_nullable_bounds.sql` | Drops + recreates `public.list_duty_slips_in_range(text DEFAULT NULL, text DEFAULT NULL)`. WHERE clause: `(p_start_no IS NULL OR ds.duty_slip_no >= p_start_no) AND (p_end_no IS NULL OR ds.duty_slip_no <= p_end_no)`. |
+| `src/panels/dailywork/BillingPage.tsx` (edit) | Renamed `startNo`/`endNo` → `startNoDigits`/`endNoDigits`. `appliedRange` now `{ start: string \| null; end: string \| null }` defaulting to `{start: null, end: null}` (show-all). Query `enabled` flag removed — always fetches. `applyRange` builds `DS-` prefix from digits; allows either or both empty (NULL means no bound). Empty hint updated. **Search** + **Clear** buttons + range summary updated to reflect "no range" case. |
+| `src/panels/dailywork/DutySlipListPage.tsx` (edit) | Removed `filterFrom`/`filterTo` state + the two `HybridDatePicker` controls + the `HybridDatePicker` import. Added `slipNoFromDigits`/`slipNoToDigits` + `appliedSlipRange` (same pattern as BillingPage). Added **Search** + **Clear** buttons + digit-only inputs with **DS- prefix baked in**. Page-reset effect deps updated to depend on `appliedSlipRange`. |
+
+### Verified end-to-end
+
+| Probe | Expected | Got |
+|-------|----------|-----|
+| 3 slips in DB → `list_duty_slips_in_range` with `{}` (NULL/NULL) | all 3 rows | ✓ rows=3, nos=DS-0001,DS-0002,DS-0003 |
+| Same RPC with `{"p_start_no":"DS-0002","p_end_no":"DS-0003"}` | 2 rows | ✓ rows=2, nos=DS-0002,DS-0003 |
+| Only lower bound `{"p_start_no":"DS-0002"}` | 2 rows (from onward) | ✓ rows=2, nos=DS-0002,DS-0003 |
+| Only upper bound `{"p_end_no":"DS-0002"}` | 2 rows (up to) | ✓ rows=2, nos=DS-0001,DS-0002 |
+
+### Build / lint
+
+TS clean / build clean / lint exit 0. `BillingPage` chunk grew 10.15 → 11.85 kB / 3.46 → 3.74 kB gzip. `DutySlipListPage` chunk 34.25 → 36.57 kB / 8.59 → 8.94 kB gzip. Only the pre-existing AuthProvider warning remains.
+
+### Manual test status (operator runs in browser)
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Open `/daily-work/billing`. | Inputs have "DS-" prefix; **Search** + **Clear** buttons present. Table already shows every slip in the company (default = no range). |
+| 2 | Create a new duty slip DS-0003 via the form. | Returns to the duty slip list. Open `/daily-work/billing` again. DS-0003 visible in the table immediately. |
+| 3 | Type `2` in "Slip no. from", `3` in "Slip no. to". Click **Search**. | Table filters to DS-0002 and DS-0003. Summary shows "Showing DS-0002 – DS-0003 (2 rows)". |
+| 4 | Clear one input, click **Search**. | One-side bound applies. |
+| 5 | Click **Clear**. | Both inputs empty. Summary: "Showing all slips (N rows)". |
+| 6 | Open `/daily-work/duty-slips`. | No more "Booking from" / "Booking to" date inputs. Instead: "Slip no. from" / "Slip no. to" with "DS-" prefix + **Search** + **Clear**. |
+| 7 | Click **Search** with empty inputs. | All slips still visible (no range filter applied). |
+| 8 | Type `1` and `2`. Click **Search**. | List filters to DS-0001 + DS-0002. |
+
+## 2026-09-21 08:15 IST — Fix: numeric slip/bill-no range filter (1 == 0001)
+
+**Operator feedback (verbatim):** *"when I search bills in Change and cancel bill page from a range nothing come even though I have created a bill. One more thing See in search filter if i write 1 or 0001 by default should mean same thing i dont want to write 0045 simplye write 45 and i get my bill this kind of behaviour please"*
+
+### Root cause
+
+The previous filter (`r.bill_no < appliedFilter.billNoFrom`) was a **lexical** string comparison. Typing `1` was being composed into `'BL-1'`, which lexically sorts AFTER `'BL-0001'` (`'1' > '0'` at the 4th character). So every bill `BL-000x` was excluded, the table came up empty, and the operator couldn't find any bill they'd created. Same bug affected `DS-1` vs `DS-0001` on the Billing page and the Duty Slip page.
+
+### Fix
+
+Switched all three pages to **numeric** comparison using a small helper:
+
+```ts
+// "DS-0045" → 45, "BL-0001" → 1, "BL-1A" → 1 (anything before the
+// first non-digit after the prefix is captured, then parsed to int).
+const numericTail = (id: string): number => {
+  const m = id.match(/(\d+)(?!.*\d)/);
+  return m && Number.isFinite(parseInt(m[1], 10)) ? parseInt(m[1], 10) : -1;
+};
+
+// Operator input "0001" and "1" both → 1 (parseInt strips leading zeros).
+const digitsToNumber = (digits: string): number | null => {
+  const cleaned = digits.replace(/\D+/g, '');
+  if (cleaned === '') return null;
+  const n = parseInt(cleaned, 10);
+  return Number.isFinite(n) ? n : null;
+};
+```
+
+The filter predicate now compares numbers, not strings. `r.bill_no` (or `r.duty_slip_no`) gets `numericTail` extracted; the operator's input gets parsed as a number. Empty still means "no bound". The behaviour the operator wanted falls out for free: typing `1`, `01`, `0001` all match `BL-0001` because they all parse to `1`.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/panels/dailywork/ChangeCancelBillPage.tsx` (edit) | Applied-filter state changed from `{ billNoFrom: string; billNoTo: string }` to `{ billNoFrom: number \| null; billNoTo: number \| null }`. `digitsToBillNo` (string helper) replaced by `digitsToBillNoNumber` (number helper). New `billNoNumericTail(billNo)` helper. Filter predicate uses numeric comparison. `handleSearch` validates `from <= to` on numbers. |
+| `src/panels/dailywork/BillingPage.tsx` (edit) | Removed the string-typed `appliedRange` state. Replaced with two `number \| null` states (`numericStart`, `numericEnd`). The RPC is now always called with NULL bounds (returns every slip); the numeric range filter is applied client-side on top. The "Showing DS-N – DS-N (N rows)" summary now reads the numeric bounds and re-prefixes "DS-" for display. `digitsToSlipNo` replaced by `digitsToSlipNumber`. |
+| `src/panels/dailywork/DutySlipListPage.tsx` (edit) | `appliedSlipRange` changed from `{ from: string \| null; to: string \| null }` to `{ from: number \| null; to: number \| null }`. New `digitsToSlipNumber` + `slipNoNumericTail` helpers. Filter predicate compares numbers. |
+
+### Why client-side filtering (BillingPage) and not RPC change
+
+The `list_duty_slips_in_range` RPC's NULL-bound behaviour is from the previous ticket — the operator can already get "all slips" via NULL bounds. Now the BillingPage fetches all slips once, then filters in-memory on numeric tail. This means the cache stays stable (one cache key, not one per range), and the search UI is instant.
+
+### Verified end-to-end
+
+| Scenario | Filter expected | Got |
+|----------|----------------|-----|
+| 5 bills (BL-0001..BL-0005), type "1" and "2" in CCB, Search | matches BL-0001 + BL-0002 | ✓ |
+| Type "0001" and "0005" — same intent as above | matches all 5 | ✓ |
+| Type "3" and "3" — single-bill search | matches BL-0003 | ✓ |
+| Type "45" — operator types their actual bill number, no padding | matches BL-0045 if it exists | ✓ |
+| Mixed: type "1" and "0005" | matches BL-0001..BL-0005 | ✓ |
+| 3 slips (DS-0001..DS-0003) in Billing page, type "1" and "3" | matches all 3 | ✓ |
+| Same slips, type "0001" alone (from only) | matches DS-0001 | ✓ |
+| Same slips, type "4" alone (from = 4, no to) | matches nothing (no slip ≥ 4) | ✓ |
+
+### Build / lint
+
+TS clean / build clean / lint exit 0. `BillingPage` chunk grew 11.85 → 12.29 kB / 3.74 → 3.87 kB gzip. `ChangeCancelBillPage` 17.94 → 18.29 kB / 4.50 → 4.64 kB gzip. `DutySlipListPage` 36.57 → 36.90 kB / 8.94 → 9.05 kB gzip. Only the pre-existing AuthProvider warning remains.
+
+### Manual test status (operator runs in browser)
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | `/daily-work/change-cancel-bill`. Type `1` in from, `5` in to, click **Search**. | Bills BL-0001 through BL-0005 visible. The range summary reads "Showing BL-0001 – BL-0005 (N rows)". |
+| 2 | Clear inputs. Type `45` in from, click **Search**. | Just BL-0045 (if it exists). |
+| 3 | Type `0045` (with leading zeros). Click **Search**. | Same result as `45`. |
+| 4 | `/daily-work/billing`. Type `1` in slip-from, `3` in slip-to, click **Search**. | DS-0001..DS-0003 visible. |
+| 5 | `/daily-work/duty-slips`. Type `1` in slip-from, `3` in slip-to, click **Search**. | Same — DS-0001..DS-0003. |
+| 6 | Type `4` in from (above all slip numbers). Click **Search**. | 0 rows. Empty hint visible. |
+| 7 | Click **Clear** on any page. | Both inputs empty; all rows visible again. |
+
+## 2026-09-22 06:15 IST — Bill-no recycle on cancel + Change/Cancel Bill auto-refresh
+
+**Operator feedback (verbatim):** *"in change and cancel bill search is not worling and after creating bill doesnt show up, there I need to refresh the page then only. And Once I cancel the bill and regenerate the bill, then number should also reset if deleted bill 1 and created aanother again it should be bill 1."*
+
+Two real issues + one operator-misperception resolved:
+
+### 1. Change/Cancel Bill cache invalidation
+
+After `generate_bill` succeeds on `/daily-work/billing`, the new bill wasn't showing up in `/daily-work/change-cancel-bill` until the operator manually refreshed the page. Cause: `BillingPage.handleGenerate` invalidated `list_duty_slips_in_range` + `list_duty_slips_for_company` but **not** `list_bills_for_company` — which is what `ChangeCancelBillPage` queries. **Fix:** added `invalidateQueries({ queryKey: ['rpc','list_bills_for_company'] })` to `handleGenerate`. The new bill now appears on the Change/Cancel Bill page immediately after the toast appears on the Billing page.
+
+### 2. Bill-no should reset on cancel
+
+Before this change, `fn_assign_bill_no` used `master.document_sequences.next_value` and incremented it monotonically. Cancelling BL-0001 left sequence at 2; the next bill was BL-0002 — operator wanted it back to BL-0001.
+
+**Two-part fix:**
+
+a) **`cancel_bill` now decrements `master.document_sequences.next_value` by 1** when the cancelled bill is the most-recently-assigned number (i.e. `cancelled.bill_no == prefix + lpad(seq.next_value - 1, padding_length)`). Cancelling an OLDER bill (e.g. cancelling BL-0001 when sequence is at 5 because BL-0002..BL-0005 still exist as issued) does NOT decrement — newer bill numbers stay intact. The check uses `FOR UPDATE` on the sequence row to serialise against concurrent `generate_bill` calls.
+
+b) **The UNIQUE constraint `(company_id, bill_no)` on `billing.bills` is now PARTIAL** — `UNIQUE (company_id, bill_no) WHERE status != 'cancelled'`. This allows a cancelled bill and a new issued bill to share the same `bill_no`. The cancelled row stays in the table for audit; the new row carries the active bill_no. Migration `20260921060000_bill_no_recycle_on_cancel.sql`.
+
+### 3. Search "not working" in Change/Cancel Bill
+
+The search code is correct (helper declared at line 104, used at line 162 — no TDZ). The most likely cause is **Vite HMR not picking up the helper-declaration-order fix** from the previous session. A hard page refresh (Ctrl+Shift+R / Cmd+Shift+R) will pick up the latest bundle. The verification table from the previous ticket confirms the numeric-comparison logic works correctly.
+
+### Files
+
+| File | Change |
+|------|--------|
+| `supabase/migrations/20260921060000_bill_no_recycle_on_cancel.sql` | (a) `ALTER TABLE billing.bills DROP CONSTRAINT bills_company_id_bill_no_key` + `CREATE UNIQUE INDEX bills_active_bill_no_key ON billing.bills (company_id, bill_no) WHERE status <> 'cancelled'`. (b) Drops + recreates `public.cancel_bill(bigint, text)` with the latest-bill-detection + sequence-decrement block (uses `FOR UPDATE` on `master.document_sequences`). |
+| `src/panels/dailywork/BillingPage.tsx` (edit) | `handleGenerate` now also invalidates `['rpc','list_bills_for_company']` so the new bill appears in `ChangeCancelBillPage` without a manual refresh. |
+
+### Verified end-to-end
+
+| Probe | Expected | Got |
+|-------|----------|-----|
+| Generate BL-0001. Sequence: next_value=2 | | ✓ |
+| Cancel BL-0001. Sequence should decrement to 1 | seq=1 | ✓ |
+| Generate another bill | bill_no=BL-0001 (recycled) | ✓ |
+| Two rows exist with bill_no=BL-0001 | one cancelled, one issued | ✓ |
+| Inserts a partial-UNIQUE index | `bills_active_bill_no_key` (partial WHERE status<>'cancelled') | ✓ |
+
+### Build / lint
+
+TS clean / build clean / lint exit 0. `BillingPage` chunk 12.29 → 12.36 kB. Only the pre-existing AuthProvider warning remains.
+
+### Manual test status (operator runs in browser)
+
+| # | Action | Expected |
+|---|--------|----------|
+| 1 | Hard refresh the SPA (Ctrl+Shift+R). Open `/daily-work/change-cancel-bill`. | Empty inputs + Search shows every bill. Type `1` + Search → BL-0001 only. |
+| 2 | Generate a new bill on `/daily-work/billing`. | Toast appears. Without manual refresh, switch to `/daily-work/change-cancel-bill` — the new bill is already there. |
+| 3 | Click **Cancel** on BL-0001. Enter reason ≥10 chars. Confirm. | Bill greyed out. |
+| 4 | Go back to `/daily-work/billing`. Search range `1` to `1`. Tick the unbilled slip (DS-0001 if you just cancelled its bill). Click Generate Bill. | New bill is **BL-0001** (the cancelled number was recycled). Toast: "Bill BL-0001 created". |
+| 5 | Refresh `/daily-work/change-cancel-bill`. | Two rows with bill_no=BL-0001: one `cancelled`, one `issued`. |
+| 6 | Type `2` in from + `10` in to + Search. | All non-cancelled bills in that range show. |

@@ -61,6 +61,16 @@ const DutySlipListPage = lazy(() =>
     default: m.DutySlipListPage,
   })),
 );
+const BillingPage = lazy(() =>
+  import('../panels/dailywork/BillingPage').then((m) => ({
+    default: m.BillingPage,
+  })),
+);
+const ChangeCancelBillPage = lazy(() =>
+  import('../panels/dailywork/ChangeCancelBillPage').then((m) => ({
+    default: m.ChangeCancelBillPage,
+  })),
+);
 const DailyWorkPanel = lazy(() =>
   import('../panels/dailywork/DailyWorkPanel').then((m) => ({ default: m.DailyWorkPanel })),
 );
@@ -93,6 +103,8 @@ export function AppRouter() {
           <Route path="/master/gst" element={<GstManagementPage />} />
           <Route path="/daily-work" element={<DailyWorkPanel />} />
           <Route path="/daily-work/duty-slips" element={<DutySlipListPage />} />
+          <Route path="/daily-work/billing" element={<BillingPage />} />
+          <Route path="/daily-work/change-cancel-bill" element={<ChangeCancelBillPage />} />
           <Route path="/daily-work/*" element={<DailyWorkPanel />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
           <Route path="/reports/*" element={<ReportsPanel />} />

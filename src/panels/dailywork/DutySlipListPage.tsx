@@ -3,6 +3,11 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
 import { supabase } from '../../services/supabaseClient';
+import {
+  fetchData,
+  getBlobURL,
+  revokeBlobURLDelayed,
+} from '../../services/PdfTemplateFactory';
 import { DutySlipFormModal } from './DutySlipFormModal';
 import type { DutySlipInitial } from './DutySlipFormModal';
 
@@ -96,16 +101,24 @@ export function DutySlipListPage() {
     await queryClient.invalidateQueries({ queryKey: ['rpc', 'list_duty_slips_for_company'] });
   };
 
-  // TAXI-807 — Print placeholder. Cancelled slips are blocked (per MTP
-  // step 3); billed slips are allowed (a printed copy of the source
-  // duty slip alongside a bill is a normal request).
-  const handlePrint = (c: DutySlipRow) => {
+  // TAXI-1103 — Print via PdfTemplateFactory. Cancelled slips are
+  // blocked client-side; billed/closed/open slips fetch via the RPC
+  // + open the blob URL in a new tab. The blob URL is revoked after
+  // 5 min to free memory without prematurely breaking a slow user.
+  const handlePrint = async (c: DutySlipRow) => {
     if (c.status === 'cancelled') {
       window.alert('Cancelled duty slips cannot be printed.');
       return;
     }
-    const url = `/print-placeholder.html?duty_slip_no=${encodeURIComponent(c.duty_slip_no)}`;
-    window.open(url, '_blank', 'noopener,noreferrer');
+    try {
+      const data = await fetchData('duty_slip', c.duty_slip_no);
+      const url = await getBlobURL('duty_slip', data);
+      window.open(url, '_blank', 'noopener,noreferrer');
+      revokeBlobURLDelayed(url);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      window.alert(`Print failed: ${msg}`);
+    }
   };
 
   // -- queries ----------------------------------------------------------------

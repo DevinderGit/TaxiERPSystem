@@ -83,6 +83,9 @@ const ReportsPanel = lazy(() =>
 const UserManagementPage = lazy(() =>
   import('../panels/settings/UserManagementPage').then((m) => ({ default: m.UserManagementPage })),
 );
+const PrintPage = lazy(() =>
+  import('../panels/dailywork/PrintPage').then((m) => ({ default: m.PrintPage })),
+);
 
 export function AppRouter() {
   return (
@@ -105,6 +108,7 @@ export function AppRouter() {
           <Route path="/daily-work/duty-slips" element={<DutySlipListPage />} />
           <Route path="/daily-work/billing" element={<BillingPage />} />
           <Route path="/daily-work/change-cancel-bill" element={<ChangeCancelBillPage />} />
+          <Route path="/daily-work/print" element={<PrintPage />} />
           <Route path="/daily-work/*" element={<DailyWorkPanel />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
           <Route path="/reports/*" element={<ReportsPanel />} />

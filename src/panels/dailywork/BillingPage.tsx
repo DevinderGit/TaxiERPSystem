@@ -3,6 +3,11 @@ import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
 import { supabase } from '../../services/supabaseClient';
+import {
+  fetchData,
+  getBlobURL,
+  revokeBlobURLDelayed,
+} from '../../services/PdfTemplateFactory';
 
 /**
  * BillingPage — M9 / TAXI-903 rev2.
@@ -75,6 +80,7 @@ export function BillingPage() {
   const [lockedCustomerId, setLockedCustomerId] = useState<number | null>(null);
   const [remarks, setRemarks] = useState<string>('');
   const [busy, setBusy] = useState(false);
+  const [printing, setPrinting] = useState(false);
   const [actionNotice, setActionNotice] = useState<
     { billNo: string; total: number } | null
   >(null);
@@ -446,14 +452,35 @@ export function BillingPage() {
               <strong>₹{actionNotice.total.toFixed(2)}</strong>.
             </span>
             <a
-              href={`/print-placeholder.html?bill_no=${encodeURIComponent(actionNotice.billNo)}`}
-              target="_blank"
-              rel="noopener noreferrer"
+              href="#"
+              role="button"
               data-testid="bill-print-link"
+              data-busy={printing ? 'true' : 'false'}
               className="btn"
-              style={{ padding: '0.25rem 0.6rem', fontSize: '0.85rem' }}
+              style={{
+                padding: '0.25rem 0.6rem',
+                fontSize: '0.85rem',
+                opacity: printing ? 0.6 : 1,
+                pointerEvents: printing ? 'none' : 'auto',
+              }}
+              onClick={(e) => {
+                e.preventDefault();
+                if (printing) return;
+                setPrinting(true);
+                fetchData('bill', actionNotice.billNo)
+                  .then((data) => getBlobURL('bill', data))
+                  .then((url) => {
+                    window.open(url, '_blank', 'noopener,noreferrer');
+                    revokeBlobURLDelayed(url);
+                  })
+                  .catch((err: unknown) => {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    window.alert(`Print failed: ${msg}`);
+                  })
+                  .finally(() => setPrinting(false));
+              }}
             >
-              🖨 Print Bill
+              {printing ? 'Generating…' : '🖨 Print Bill'}
             </a>
             <button
               type="button"

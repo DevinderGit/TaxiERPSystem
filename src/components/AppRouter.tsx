@@ -83,6 +83,15 @@ const LedgerBookPage = lazy(() =>
 const ReportsPanel = lazy(() =>
   import('../panels/reports/ReportsPanel').then((m) => ({ default: m.ReportsPanel })),
 );
+const BillCoverReport = lazy(() =>
+  import('../panels/reports/BillCoverReport').then((m) => ({ default: m.BillCoverReport })),
+);
+const BillRegisterReport = lazy(() =>
+  import('../panels/reports/BillRegisterReport').then((m) => ({ default: m.BillRegisterReport })),
+);
+const DutyRegisterReport = lazy(() =>
+  import('../panels/reports/DutyRegisterReport').then((m) => ({ default: m.DutyRegisterReport })),
+);
 const UserManagementPage = lazy(() =>
   import('../panels/settings/UserManagementPage').then((m) => ({ default: m.UserManagementPage })),
 );
@@ -116,7 +125,13 @@ export function AppRouter() {
           <Route path="/accounts" element={<AccountsPanel />} />
           <Route path="/accounts/ledger" element={<LedgerBookPage />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
-          <Route path="/reports/*" element={<ReportsPanel />} />
+          <Route path="/reports" element={<ReportsPanel />} />
+          <Route path="/reports/bill-cover" element={<BillCoverReport />} />
+          <Route path="/reports/bill-register" element={<BillRegisterReport />} />
+          <Route path="/reports/duty-register" element={<DutyRegisterReport />} />
+          {/* /reports/* catch-all intentionally removed — the explicit
+              routes above cover every valid URL. Anything else falls
+              through to the NotFoundPage at the bottom. */}
           <Route
             path="/settings/users"
             element={

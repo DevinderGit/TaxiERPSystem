@@ -30,6 +30,15 @@ import {
 import type { BillPDFData } from '../../templates/pdf/BillPDF';
 import type { DutySlipPDFData } from '../../templates/pdf/DutySlipPDF';
 
+// PrintPage only exposes Bill + Duty Slip in the dropdown. The
+// factory registry carries other templates (ledger from M12, M13
+// report stubs) but those get their own dedicated pages.
+type PrintPageTemplate = 'bill' | 'duty_slip';
+
+function isPrintPageTemplate(name: string): name is PrintPageTemplate {
+  return name === 'bill' || name === 'duty_slip';
+}
+
 // ---------------------------------------------------------------------------
 // Per-template data fetch is handled by PdfTemplateFactory.fetchData,
 // so the data-projection logic lives in exactly one place.
@@ -39,11 +48,9 @@ import type { DutySlipPDFData } from '../../templates/pdf/DutySlipPDF';
 // Page
 // ---------------------------------------------------------------------------
 
-const PLACEHOLDER: Record<TemplateName, string> = {
+const PLACEHOLDER: Record<PrintPageTemplate, string> = {
   bill: 'BL-0001',
   duty_slip: 'DS-0001',
-  bill_cover_report: '(M13 — not implemented)',
-  duty_register_report: '(M13 — not implemented)',
 };
 
 export function PrintPage() {
@@ -54,9 +61,9 @@ export function PrintPage() {
   const initialType = (params.get('type') ?? 'bill') as TemplateName;
   const initialId   = params.get('id') ?? '';
 
-  const supported = supportedTemplateNames();
-  const [docType, setDocType] = useState<TemplateName>(
-    supported.includes(initialType) ? initialType : (supported[0] ?? 'bill'),
+  const supported = supportedTemplateNames().filter(isPrintPageTemplate);
+  const [docType, setDocType] = useState<PrintPageTemplate>(
+    isPrintPageTemplate(initialType) ? initialType : (supported[0] ?? 'bill'),
   );
   const [docId, setDocId]         = useState<string>(initialId);
   const [blobUrl, setBlobUrl]     = useState<string | null>(null);
@@ -94,7 +101,7 @@ export function PrintPage() {
     });
 
     try {
-      const data = await fetchData(docType, id);
+      const data = (await fetchData(docType, id)) as BillPDFData | DutySlipPDFData;
       const url = await getBlobURL(docType, data);
       setBlobUrl(url);
       setMeta(buildMeta(docType, data));
@@ -108,7 +115,7 @@ export function PrintPage() {
 
   // Auto-render on mount if both params present (deep-link).
   useEffect(() => {
-    if (initialId && supported.includes(initialType)) {
+    if (initialId && isPrintPageTemplate(initialType)) {
       void fetchAndRender();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -143,7 +150,8 @@ export function PrintPage() {
             data-testid="print-type"
             value={docType}
             onChange={(e) => {
-              setDocType(e.target.value as TemplateName);
+              const v = e.target.value;
+              if (isPrintPageTemplate(v)) setDocType(v);
               setBlobUrl(null);
               setMeta(null);
               setError(null);

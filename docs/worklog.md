@@ -2798,3 +2798,81 @@ The logo data flow is fully wired end-to-end and ready to use. If you ever want 
 ### Open questions for operator
 
 None for 1104. **M11 is complete** once you confirm the address / phone / GSTIN / state round-trip works in the browser. After that, M12 (Ledger Book + Manual Receipt/Payment) is next — say "ok M12" to start.
+
+---
+
+## 2026-09-23 06:30 IST — TAXI-1201 — Ledger Book page + Ledger PDF (simplified operator scope)
+
+**Operator request (verbatim):** "No Url needed in Ledger, Ledger will show bill number, client and amount credited for now according to the bill numeber range filter and it is printable same like bills in pdf format."
+
+This is a deliberate simplification of the spec — no deep-link pre-selection, no per-customer/date/entry_type filter, no running balance, no receipt/payment entry forms. Just: bill range filter → table → printable A4 PDF.
+
+**Operator decisions on this scope:**
+- "amount credited" = bill grand_total (one row per bill)
+- PDF = A4 with company header (same layout philosophy as BillPDF)
+
+### Files
+
+| File | Change |
+|------|--------|
+| `supabase/migrations/20260922095000_list_ledger_for_company.sql` (new) | RPC `public.list_ledger_for_company()` returning every bill + customer name + the current `core.companies` row (via `CROSS JOIN LATERAL`) so the LedgerPDF can render the header without a second RPC. Cancelled rows kept (recycle-on-cancel M10 duplicates); the page dedupes in JS. |
+| `src/hooks/useLedgerData.ts` (new) | Shared types + helpers: `LedgerEntry` shape, `billNoNumericTail`, `digitsToBillNoNumber`, `dedupeByBillNo` (prefer issued over cancelled), `filterByBillNoRange`, `useLedgerQuery` (TanStack Query wrapping the RPC). |
+| `src/templates/pdf/LedgerPDF.tsx` (new) | React-PDF A4 page: "LEDGER BOOK" title + company header (3-column: GSTIN/SAC/PAN + address + contact) + filter context line ("Showing N bill(s) in range from → to. Generated: …") + bill table (bill_no / date / customer / status / amount) + yellow GRAND TOTAL row + signature + paginated footer. |
+| `src/services/PdfTemplateFactory.ts` (edit) | Added `'ledger'` to `TemplateName`, registered `LedgerPDF` as the component, added `fetchLedgerPdfData(rangeInput)` that parses "from-to" input, calls the RPC, dedupes, filters, builds the full `LedgerPDFData` including company header + total. |
+| `src/panels/accounts/LedgerBookPage.tsx` (new) | The page at `/accounts/ledger`. Filter bar (From bill no / To bill no inputs + Search + Clear + Print Ledger buttons). Summary line: "Showing N of M bill(s) — range X → Y. Total: ₹Z." Table with bill_no / date / customer / status badge / amount. GRAND TOTAL row in yellow. Print button generates the LedgerPDF client-side (same pattern as BillingPage toast / DutySlipListPage Print — `pdf().toBlob()` → blob URL → `window.open()`). |
+| `src/panels/dailywork/PrintPage.tsx` (edit) | Narrowed the type system so PrintPage only exposes Bill + Duty Slip. The new `ledger` template in the factory is reachable via `/accounts/ledger` only — PrintPage doesn't list it (would be confusing UX to mix a range-filter template with a single-doc template in one dropdown). |
+| `src/components/AppRouter.tsx` (edit) | Added `/accounts/ledger` route with `LedgerBookPage`. `/accounts/*` still points at `AccountsPanel` (the landing — its placeholder card will be updated in a later ticket). |
+
+### Verified end-to-end
+
+| Probe | Expected | Got |
+|-------|----------|-----|
+| Migration `20260922095000` apply | Function created + GRANT | ✓ |
+| RPC payload shape (10 columns + 17 company columns, CROSS JOIN LATERAL) | All keys present | ✓ |
+| 6 bills in operator's DB + "Sidhartha Taxi Service" company header | matches | ✓ |
+| `npm run build` | TS clean, Vite emits `PdfTemplateFactory-*.js` (1.35 MB, includes LedgerPDF) + `LedgerBookPage-*.js` chunks | ✓ |
+| `npm run lint` | Only the pre-existing AuthProvider warning | ✓ |
+
+### Operator manual test (browser)
+
+1. Hard refresh (`Ctrl+Shift+R`). Docker was offline at session start so I restarted it; if your Supabase was offline, start it before testing.
+2. Navigate to **`/accounts/ledger`**. **Pass criterion:** Page shows a filter bar (From bill no / To bill no / Search / Clear / Print Ledger), an empty hint, and a summary line.
+3. Type **`1`** in "From bill no", leave "To bill no" empty, click **Search**. **Pass criterion:** All bills show (3 unique bill_nos: BL-0001, BL-0002, BL-0003). Total at the bottom = sum of grand_totals of the issued/deduplicated rows (BL-0001 cancelled → not in table, BL-0002 issued 1302, BL-0003 cancelled → not in table). Expect total = **₹1302.00**.
+4. Type **`1`** and **`3`**, click **Search**. Same result (filter is inclusive). Summary updates.
+5. Type **`0001`** in "From" — same result as `1` (numeric-tail aware; "1 == 0001" per M10).
+6. Type **`2`** only in "To" (no "From") — bills with numeric tail ≤ 2 → BL-0001 + BL-0002.
+7. Click **Clear** — both inputs empty, table shows all bills.
+8. **Print test:** with a non-empty range applied, click **🖨 Print Ledger**. **Pass criterion:** Button shows "Generating…" briefly, then a new browser tab opens with the LedgerPDF. The PDF shows: company header (3-column with your "Sidhartha Taxi Service" + GSTIN + SAC + State Code + S.T.Ctgry + address + phone), "LEDGER BOOK" title, "Bill No. Range" on the right, filter context line ("Showing N bill(s) in range BL-XXXX → BL-YYYY. Generated: <date>"), the bill table with yellow GRAND TOTAL row, "For Sidhartha Taxi Service / Authorized Signatory" signature, paginated footer.
+9. Print a range with cancelled bills excluded (e.g. only `2-2`) → PDF shows just the BL-0002 issued row. Status badge reads "ISSUED".
+10. **Edge case:** set From=5, To=2 → Search → red banner or `window.alert` "From bill number must be ≤ to bill number."
+11. **Zero-bill scenario:** Set both to non-existent numbers (e.g. 999-9999) → table empty with "No bills in the selected range. Try a wider range or click Clear." Print with this range → PDF shows just the company header + filter context + empty table + zero total.
+
+Tell me what's off. When happy, the next tickets in M12 are TAXI-1202 (Record Receipt) / 1203 (Record Payment) / 1204 (Manual Adjustment) / 1205 / 1206 / 1207 (role gating) — say which one to start next, or say "skip M12 receipts and go to M13" if you want to defer the manual entry forms.
+
+---
+
+## 2026-09-23 07:00 IST — TAXI-1201 — UX nits: navlink + default-empty table
+
+**Operator feedback (verbatim):** "why didnt you add navlink to accounts/ledger why give url? also by default do not show bills under ledger only after i press search then pop them up."
+
+Two fair catches:
+
+### Files
+
+| File | Change |
+|------|--------|
+| `src/panels/accounts/AccountsPanel.tsx` (edit) | Added a `NavLink` to `Ledger Book` (matching the Daily Work panel pattern from TAXI-1103). Replaced the M12 placeholder card with a helpful line pointing at the route. |
+| `src/panels/accounts/LedgerBookPage.tsx` (edit) | Added `hasSearched` state. The table + summary line are hidden until the first `Search` click. `Clear` resets `hasSearched` back to false. Default state: empty card says "Pick a bill-number range above and click **Search** to view the ledger." |
+
+### Verified
+
+`npm run build` clean, `npm run lint` clean (only the pre-existing AuthProvider warning).
+
+### Operator manual test
+
+1. Hard refresh.
+2. Navigate to `/accounts` (or click "Accounts" in the top nav). **Pass criterion:** Sub-nav now has a **Ledger Book** button. Click it → land on `/accounts/ledger`.
+3. On `/accounts/ledger`, with no search yet: **Pass criterion:** Empty card with hint "Pick a bill-number range above and click **Search** to view the ledger." No summary line, no table.
+4. Type `1` in From, click **Search** → table appears, summary line shows "Showing N of M bill(s) — range 1 → * …"
+5. Click **Clear** → table + summary disappear, hint returns.
+6. Click **Print Ledger** → still works (uses current filter state; with no filter applied, prints all bills).

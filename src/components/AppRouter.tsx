@@ -77,6 +77,9 @@ const DailyWorkPanel = lazy(() =>
 const AccountsPanel = lazy(() =>
   import('../panels/accounts/AccountsPanel').then((m) => ({ default: m.AccountsPanel })),
 );
+const LedgerBookPage = lazy(() =>
+  import('../panels/accounts/LedgerBookPage').then((m) => ({ default: m.LedgerBookPage })),
+);
 const ReportsPanel = lazy(() =>
   import('../panels/reports/ReportsPanel').then((m) => ({ default: m.ReportsPanel })),
 );
@@ -110,6 +113,8 @@ export function AppRouter() {
           <Route path="/daily-work/change-cancel-bill" element={<ChangeCancelBillPage />} />
           <Route path="/daily-work/print" element={<PrintPage />} />
           <Route path="/daily-work/*" element={<DailyWorkPanel />} />
+          <Route path="/accounts" element={<AccountsPanel />} />
+          <Route path="/accounts/ledger" element={<LedgerBookPage />} />
           <Route path="/accounts/*" element={<AccountsPanel />} />
           <Route path="/reports/*" element={<ReportsPanel />} />
           <Route

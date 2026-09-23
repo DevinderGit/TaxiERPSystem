@@ -45,6 +45,16 @@ import {
   DutySlipPDF,
   type DutySlipPDFData,
 } from '../templates/pdf/DutySlipPDF';
+import {
+  LedgerPDF,
+  type LedgerPDFData,
+} from '../templates/pdf/LedgerPDF';
+import {
+  dedupeByBillNo,
+  filterByBillNoRange,
+  digitsToBillNoNumber,
+  type LedgerEntry,
+} from '../hooks/useLedgerData';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -54,7 +64,8 @@ export type TemplateName =
   | 'bill'
   | 'duty_slip'
   | 'bill_cover_report'
-  | 'duty_register_report';
+  | 'duty_register_report'
+  | 'ledger';
 
 export type TemplateData =
   | { name: 'bill'; data: BillPDFData }
@@ -78,6 +89,10 @@ const TEMPLATES: Record<TemplateName, TemplateEntry> = {
     component: DutySlipPDF,
     dataLabel: 'Duty slip data (from get_duty_slip_for_pdf RPC)',
   },
+  ledger: {
+    component: LedgerPDF,
+    dataLabel: 'Ledger entry list + company header',
+  },
   // M13 — stubbed.
   bill_cover_report: {
     component: null,
@@ -92,6 +107,7 @@ const TEMPLATES: Record<TemplateName, TemplateEntry> = {
 const TEMPLATE_DISPLAY_NAMES: Record<TemplateName, string> = {
   bill: 'Bill',
   duty_slip: 'Duty Slip',
+  ledger: 'Ledger',
   bill_cover_report: 'Bill Cover Report (M13)',
   duty_register_report: 'Duty Register Report (M13)',
 };
@@ -130,24 +146,136 @@ export function getTemplateDataLabel(name: TemplateName): string {
  * - `duty_slip`   → `get_duty_slip_for_pdf(p_duty_slip_no)`
  *                   Throws a friendly error if the slip is cancelled
  *                   (per TAXI-1102 MTP step 12).
+ * - `ledger`      → returns `{ entries, fromBillNo, toBillNo }` parsed
+ *                   from `documentNo` like "from-to" (e.g. "1-5").
+ *                   Both ends optional: "1-" → from 1; "-5" → to 5;
+ *                   "" or "-" → all.
  * - `bill_cover_report` / `duty_register_report` → throws "coming in M13".
  */
 export async function fetchData(
   name: TemplateName,
   documentNo: string,
-): Promise<BillPDFData | DutySlipPDFData> {
-  const id = documentNo.trim();
-  if (!id) throw new Error('Document number is required.');
-
+): Promise<BillPDFData | DutySlipPDFData | LedgerPDFData> {
   if (name === 'bill') {
+    const id = documentNo.trim();
+    if (!id) throw new Error('Bill number is required.');
     return await fetchBillForPdf(id);
   }
   if (name === 'duty_slip') {
+    const id = documentNo.trim();
+    if (!id) throw new Error('Duty slip number is required.');
     return await fetchDutySlipForPdf(id);
+  }
+  if (name === 'ledger') {
+    return await fetchLedgerPdfData(documentNo);
   }
   throw new Error(
     `Template "${name}" is not yet implemented (coming in M13).`,
   );
+}
+
+/**
+ * Build the full LedgerPDFData: fetch all bills, apply the numeric
+ * range filter, fetch the company header data, compute the total.
+ *
+ * `rangeInput` format: "from-to" with either side optional.
+ *   "1-5"   → from 1 to 5
+ *   "1-"    → from 1 to open
+ *   "-5"    → from open to 5
+ *   "" or "-" → all
+ *   "3"     → just bill 3
+ */
+async function fetchLedgerPdfData(rangeInput: string): Promise<LedgerPDFData> {
+  const trimmed = (rangeInput ?? '').trim();
+  let fromRaw = '';
+  let toRaw   = '';
+  if (trimmed.includes('-')) {
+    const [f, t] = trimmed.split('-', 2);
+    fromRaw = (f ?? '').trim();
+    toRaw   = (t ?? '').trim();
+  } else if (trimmed.length > 0) {
+    fromRaw = trimmed;
+    toRaw   = trimmed;
+  }
+  const fromN = digitsToBillNoNumber(fromRaw);
+  const toN   = digitsToBillNoNumber(toRaw);
+  if (fromN != null && toN != null && fromN > toN) {
+    throw new Error('From bill number must be ≤ to bill number.');
+  }
+
+  // 1. Bills + customer + company (single round-trip — the RPC
+  //    includes company columns via a CROSS JOIN LATERAL).
+  const ledgerResp = await supabase.rpc('list_ledger_for_company');
+  if (ledgerResp.error) throw new Error(ledgerResp.error.message);
+  const rows: any[] = (ledgerResp.data ?? []) as any[];
+
+  if (rows.length === 0) {
+    throw new Error('No bills found for this company.');
+  }
+
+  // Build the company once from the first row (every row carries the
+  // same company data due to the CROSS JOIN LATERAL).
+  const r0 = rows[0];
+  const logo_data_uri = await fetchCompanyLogoDataURI(
+    Number(r0.company_id ?? 0),
+    (r0.company_logo_path as string | null) ?? null,
+  );
+
+  const company: LedgerPDFData['company'] = {
+    name:          String(r0.company_name ?? ''),
+    legal_name:    (r0.company_legal_name as string | null) ?? null,
+    gstin:         (r0.company_gstin as string | null) ?? null,
+    pan:           (r0.company_pan as string | null) ?? null,
+    sac_no:        (r0.company_sac_no as string | null) ?? null,
+    state_code:    (r0.company_state_code as string | null) ?? null,
+    st_category:   (r0.company_st_category as string | null) ?? null,
+    address_line1: (r0.company_address_line1 as string | null) ?? null,
+    address_line2: (r0.company_address_line2 as string | null) ?? null,
+    city:          (r0.company_city as string | null) ?? null,
+    state:         (r0.company_state as string | null) ?? null,
+    pincode:       (r0.company_pincode as string | null) ?? null,
+    phone:         (r0.company_phone as string | null) ?? null,
+    email:         (r0.company_email as string | null) ?? null,
+    logo_data_uri,
+  };
+
+  // 2. Project bills into LedgerEntry.
+  const all: LedgerEntry[] = rows.map((r) => ({
+    id:            Number(r.bill_id),
+    bill_no:       String(r.bill_no),
+    bill_date:     String(r.bill_date),
+    customer_id:   Number(r.customer_id),
+    customer_name: (r.customer_name as string | null) ?? null,
+    status:        String(r.status),
+    base_amount:   Number(r.base_amount   ?? 0),
+    extra_amount:  Number(r.extra_amount  ?? 0),
+    grand_total:   Number(r.grand_total   ?? 0),
+    cgst_amount:   Number(r.cgst_amount   ?? 0),
+    sgst_amount:   Number(r.sgst_amount   ?? 0),
+    igst_amount:   Number(r.igst_amount   ?? 0),
+    total_tax:     Number(r.total_tax     ?? 0),
+    created_at:    String(r.created_at ?? ''),
+  }));
+
+  const deduped = dedupeByBillNo(all);
+  const filtered = filterByBillNoRange(deduped, fromN, toN);
+
+  // 3. Display strings
+  const fromBillNo = fromRaw ? `BL-${fromRaw.padStart(4, '0')}` : '*';
+  const toBillNo   = toRaw   ? `BL-${toRaw.padStart(4, '0')}`   : '*';
+
+  const total = filtered.reduce(
+    (acc, r) => acc + Number(r.grand_total ?? 0), 0,
+  );
+
+  return {
+    company,
+    fromBillNo,
+    toBillNo,
+    generatedAt: new Date().toISOString(),
+    entries: filtered,
+    total,
+  };
 }
 
 // ---------------------------------------------------------------------------
